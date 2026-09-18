@@ -9,6 +9,9 @@ export interface PollSummary {
   closesAt: string;
   memberCount: number;
   optionCount: number;
+  groupVersion: number;
+  merkleRoot: string;
+  frozen: boolean;
 }
 export interface PollDetail extends PollSummary {
   description: string;
@@ -28,10 +31,19 @@ export interface VoteReceipt {
   pollId: string;
   optionId: string;
   nullifier: string;
+  groupVersion: number;
   acceptedAt: string;
 }
 export interface PollResults {
   pollId: string;
   total: number;
   options: { id: string; count: number }[];
+}
+export type GroupOperation = "join" | "rotate" | "revoke";
+export interface GroupVersionSummary {
+  pollId: string;
+  groupVersion: number;
+  merkleRoot: string;
+  memberCount: number;
+  frozen: boolean;
 }

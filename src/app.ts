@@ -1,12 +1,15 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
-import { Group } from "@semaphore-protocol/group";
 import { verifyProof, type SemaphoreProof } from "@semaphore-protocol/proof";
 import { openCatalog } from "./store.ts";
 import { isProofPayload, terminateProverWorkers, textToField } from "./voting.ts";
+import type { GroupOperation } from "./types.ts";
 
 const MAX_BODY_BYTES = 1_000_000;
+// BN254 scalar field order: commitments must be non-zero field elements.
+const FIELD_SIZE = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+const COMMITMENT_PATTERN = /^[1-9]\d*$/;
 
 function readBody(request: IncomingMessage): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -20,6 +23,10 @@ function readBody(request: IncomingMessage): Promise<string> {
     request.on("end", () => resolvePromise(Buffer.concat(chunks).toString("utf8")));
     request.on("error", rejectPromise);
   });
+}
+
+function isCommitment(value: unknown): value is string {
+  return typeof value === "string" && COMMITMENT_PATTERN.test(value) && BigInt(value) < FIELD_SIZE;
 }
 
 export function createApp(databasePath: string, publicPath = resolve("dist/public")) {
@@ -70,51 +77,21 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           const result = catalog.results(id);
           return result ? json(200, { result }) : json(404, { error: "poll_not_found" });
         }
+        if (segments[3] === "group") {
+          if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
+          return handleGroupChange(id);
+        }
         if (segments[3] === "votes") {
           if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
-          const poll = catalog.get(id);
-          if (!poll) return json(404, { error: "poll_not_found" });
-          let body: unknown;
-          try { body = JSON.parse(await readBody(request)); }
-          catch { return json(400, { error: "invalid_json" }); }
-          if (typeof body !== "object" || body === null) return json(400, { error: "invalid_vote" });
-          const { optionId, proof } = body as { optionId?: unknown; proof?: unknown };
-          if (typeof optionId !== "string" || optionId.length === 0 || !isProofPayload(proof)) {
-            return json(400, { error: "invalid_vote" });
-          }
-          if (!poll.options.some(option => option.id === optionId)) return json(400, { error: "unknown_option" });
-          if (poll.status !== "open" || Date.now() >= Date.parse(poll.closesAt)) return json(409, { error: "poll_closed" });
-          // The proof must be bound to this poll (scope), the chosen option
-          // (message) and the current member tree (root) rebuilt from SQLite.
-          const group = new Group(catalog.memberCommitments());
-          let bound = false;
-          try {
-            bound =
-              proof.scope === textToField(poll.id) &&
-              proof.message === textToField(optionId) &&
-              proof.merkleTreeRoot === group.root.toString();
-          } catch { bound = false; }
-          if (!bound) return json(422, { error: "proof_binding_mismatch" });
-          let valid = false;
-          proverUsed = true;
-          try { valid = await verifyProof(proof as unknown as SemaphoreProof); }
-          catch { valid = false; }
-          if (!valid) return json(422, { error: "invalid_proof" });
-          const outcome = catalog.commitVote(poll.id, optionId, proof.nullifier);
-          if (!outcome.ok) {
-            if (outcome.reason === "duplicate_nullifier") return json(409, { error: "duplicate_nullifier" });
-            if (outcome.reason === "poll_closed") return json(409, { error: "poll_closed" });
-            return json(400, { error: "unknown_option" });
-          }
-          return json(201, { receipt: outcome.receipt });
+          return handleVote(id);
         }
       }
       if (segments[1] === "receipts" && segments.length === 3) {
         if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
-        let id: string;
-        try { id = decodeURIComponent(segments[2]); }
+        let receiptId: string;
+        try { receiptId = decodeURIComponent(segments[2]); }
         catch { return json(400, { error: "invalid_receipt_id" }); }
-        const receipt = catalog.receipt(id);
+        const receipt = catalog.receipt(receiptId);
         return receipt ? json(200, { receipt }) : json(404, { error: "receipt_not_found" });
       }
       return json(404, { error: "not_found" });
@@ -127,5 +104,107 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
     if (!file.startsWith(`${resolve(publicPath)}${sep}`) || !existsSync(file) || !statSync(file).isFile()) return json(404, { error: "not_found" });
     response.writeHead(200, { "Content-Type": mime[extname(file)] ?? "application/octet-stream", "X-Content-Type-Options": "nosniff" });
     response.end(readFileSync(file));
+
+    async function handleGroupChange(pollId: string) {
+      const poll = catalog.get(pollId);
+      if (!poll) return json(404, { error: "poll_not_found" });
+      let body: unknown;
+      try { body = JSON.parse(await readBody(request)); }
+      catch { return json(400, { error: "invalid_json" }); }
+      if (typeof body !== "object" || body === null) return json(400, { error: "invalid_group_change" });
+      const { operation, expectedVersion, commitment, oldCommitment, newCommitment } = body as {
+        operation?: unknown; expectedVersion?: unknown; commitment?: unknown; oldCommitment?: unknown; newCommitment?: unknown;
+      };
+      if (operation !== "join" && operation !== "rotate" && operation !== "revoke") return json(400, { error: "invalid_group_change" });
+      if (!Number.isInteger(expectedVersion) || (expectedVersion as number) < 1) return json(400, { error: "invalid_group_change" });
+      let params: { commitment?: string; oldCommitment?: string; newCommitment?: string };
+      if (operation === "join") {
+        if (!isCommitment(commitment)) return json(400, { error: "invalid_group_change" });
+        params = { commitment };
+      } else if (operation === "rotate") {
+        if (!isCommitment(oldCommitment) || !isCommitment(newCommitment)) return json(400, { error: "invalid_group_change" });
+        params = { oldCommitment, newCommitment };
+      } else {
+        if (!isCommitment(commitment)) return json(400, { error: "invalid_group_change" });
+        params = { commitment };
+      }
+      const outcome = catalog.applyGroupChange(pollId, operation as GroupOperation, expectedVersion as number, params);
+      if (!outcome.ok) {
+        switch (outcome.reason) {
+          case "poll_not_found": return json(404, { error: "poll_not_found" });
+          case "group_frozen":
+            return json(409, { error: "group_frozen", groupVersion: poll.groupVersion, merkleRoot: poll.merkleRoot });
+          case "version_conflict": {
+            const current = catalog.get(pollId)!;
+            return json(409, { error: "group_version_changed", groupVersion: current.groupVersion, merkleRoot: current.merkleRoot });
+          }
+          case "commitment_not_found": return json(400, { error: "commitment_not_found" });
+          case "duplicate_commitment": return json(400, { error: "duplicate_commitment" });
+          case "empty_group": return json(400, { error: "empty_group" });
+          case "poll_closed": return json(409, { error: "poll_closed" });
+        }
+      }
+      return json(201, { group: outcome.summary });
+    }
+
+    async function handleVote(pollId: string) {
+      const poll = catalog.get(pollId);
+      if (!poll) return json(404, { error: "poll_not_found" });
+      let body: unknown;
+      try { body = JSON.parse(await readBody(request)); }
+      catch { return json(400, { error: "invalid_json" }); }
+      if (typeof body !== "object" || body === null) return json(400, { error: "invalid_vote" });
+      const { optionId, proof, groupVersion } = body as { optionId?: unknown; proof?: unknown; groupVersion?: unknown };
+      if (typeof optionId !== "string" || optionId.length === 0 || !isProofPayload(proof)) {
+        return json(400, { error: "invalid_vote" });
+      }
+      if (groupVersion !== undefined && (!Number.isInteger(groupVersion) || (groupVersion as number) < 1)) {
+        return json(400, { error: "invalid_vote" });
+      }
+      if (!poll.options.some(option => option.id === optionId)) return json(400, { error: "unknown_option" });
+      if (poll.status !== "open" || Date.now() >= Date.parse(poll.closesAt)) return json(409, { error: "poll_closed" });
+      // The proof must be bound to this poll (scope) and the chosen option
+      // (message); the Merkle root is checked against the stored snapshots.
+      let bound = false;
+      try {
+        bound = proof.scope === textToField(poll.id) && proof.message === textToField(optionId);
+      } catch { bound = false; }
+      if (!bound) return json(422, { error: "proof_binding_mismatch" });
+      if (groupVersion !== undefined) {
+        // New clients pin the snapshot they proved against. A superseded (or
+        // future) version is a refreshable conflict; a wrong root at the
+        // current version is a rejected proof.
+        if ((groupVersion as number) !== poll.groupVersion) {
+          return json(409, { error: "group_version_changed", groupVersion: poll.groupVersion, merkleRoot: poll.merkleRoot });
+        }
+        if (proof.merkleTreeRoot !== poll.merkleRoot) return json(422, { error: "proof_binding_mismatch" });
+      } else {
+        // Legacy clients send no version: resolve the proof root to a snapshot.
+        const snapshot = catalog.snapshotByRoot(poll.id, proof.merkleTreeRoot);
+        if (!snapshot) return json(422, { error: "proof_binding_mismatch" });
+        if (!snapshot.current) {
+          return json(409, { error: "group_version_changed", groupVersion: poll.groupVersion, merkleRoot: poll.merkleRoot });
+        }
+      }
+      let valid = false;
+      proverUsed = true;
+      try { valid = await verifyProof(proof as unknown as SemaphoreProof); }
+      catch { valid = false; }
+      if (!valid) return json(422, { error: "invalid_proof" });
+      // Snapshot confirmation, freeze, nullifier dedup and insertion happen
+      // atomically here, so a concurrent group change can never interleave.
+      const outcome = catalog.commitVote(poll.id, optionId, proof.nullifier, proof.merkleTreeRoot);
+      if (!outcome.ok) {
+        if (outcome.reason === "duplicate_nullifier") return json(409, { error: "duplicate_nullifier" });
+        if (outcome.reason === "poll_closed") return json(409, { error: "poll_closed" });
+        if (outcome.reason === "historical_version") {
+          const current = catalog.get(pollId)!;
+          return json(409, { error: "group_version_changed", groupVersion: current.groupVersion, merkleRoot: current.merkleRoot });
+        }
+        if (outcome.reason === "unknown_root") return json(422, { error: "proof_binding_mismatch" });
+        return json(400, { error: "unknown_option" });
+      }
+      return json(201, { receipt: outcome.receipt });
+    }
   }
 }
