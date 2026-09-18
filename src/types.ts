@@ -14,6 +14,15 @@ export interface PollDetail extends PollSummary {
   description: string;
   options: PollOption[];
   eligibleMemberCommitments: string[];
+  groupVersion: number;
+  merkleRoot: string;
+}
+export interface GroupVersionSummary {
+  pollId: string;
+  version: number;
+  merkleRoot: string;
+  memberCount: number;
+  commitments: string[];
 }
 export interface SemaphoreProofPayload {
   merkleTreeDepth: number;

@@ -15,6 +15,13 @@ export function textToField(value: string): string {
 }
 
 const DECIMAL = /^(0|[1-9]\d*)$/;
+// BN254 scalar field order: commitments must be canonical field elements.
+const FIELD_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+/** Structural check of a Semaphore identity commitment received over the wire. */
+export function isCommitment(value: unknown): value is string {
+  return typeof value === "string" && DECIMAL.test(value) && BigInt(value) < FIELD_MODULUS;
+}
 
 /**
  * snarkjs keeps a pool of worker MessagePorts alive after proof generation or

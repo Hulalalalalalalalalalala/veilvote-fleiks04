@@ -24,6 +24,9 @@ const ERROR_TEXT: Record<string, string> = {
   duplicate_nullifier: "该身份已在此议题投过票（重复提交被拒绝）",
   invalid_proof: "证明无效，投票被拒绝",
   proof_binding_mismatch: "证明与议题或选项不匹配，投票被拒绝",
+  group_version_changed: "成员名单已变更，请基于最新版本重新生成证明",
+  group_frozen: "议题已有选票，成员名单已冻结",
+  unknown_merkle_root: "证明对应的成员版本不存在",
   unknown_option: "选项无效",
   invalid_vote: "提交内容格式不正确",
   poll_not_found: "议题不存在"
@@ -119,7 +122,7 @@ function voteSection(poll: PollDetail): HTMLElement {
       const { receipt } = await request<{ receipt: VoteReceipt }>(`/api/polls/${encodeURIComponent(poll.id)}/votes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ optionId, proof })
+        body: JSON.stringify({ optionId, groupVersion: poll.groupVersion, proof })
       });
       identityInput.value = "";
       status.textContent = "投票已被接受，回执如下（可凭回执编号随时查询）。";
@@ -131,8 +134,12 @@ function voteSection(poll: PollDetail): HTMLElement {
       receiptBox.replaceChildren(receiptList);
       await refreshResults();
     } catch (error) {
+      const code = (error as { body?: { error?: string } })?.body?.error;
       status.textContent = `${errorText(error)} 可修正后重试。`;
       status.className = "vote-status error";
+      // The membership snapshot moved on: reload the detail so the next proof
+      // is generated against the current version and root.
+      if (code === "group_version_changed") setTimeout(() => void showPoll(poll.id), 1500);
     } finally {
       busy = false;
       submit.disabled = false;
@@ -161,14 +168,17 @@ async function showPoll(id: string) {
     const heading = text("div", "", "detail-heading");
     heading.append(text("span", "公开议题", "tag"), text("span", `发布于 ${date(poll.publishedAt)}`, "muted"));
     const stats = text("div", "", "stats");
-    for (const [label, value] of [["参与成员", `${poll.memberCount} 位`], ["可选方案", `${poll.optionCount} 项`], ["截止日期", date(poll.closesAt)]]) {
+    for (const [label, value] of [["参与成员", `${poll.memberCount} 位`], ["可选方案", `${poll.optionCount} 项`], ["成员版本", `v${poll.groupVersion}`], ["截止日期", date(poll.closesAt)]]) {
       const item = text("div", ""); item.append(text("span", label, "muted"), text("strong", value)); stats.append(item);
     }
     const options = document.createElement("ol"); options.className = "options";
     poll.options.forEach((option, index) => { const item = document.createElement("li"); item.append(text("span", String(index + 1).padStart(2, "0"), "option-number"), text("span", option.label)); options.append(item); });
     const commitments = document.createElement("details"); commitments.className = "commitments";
-    commitments.append(text("summary", `成员公开承诺 · ${poll.eligibleMemberCommitments.length} 项`));
+    commitments.append(text("summary", `成员公开承诺 · ${poll.eligibleMemberCommitments.length} 项 · 版本 v${poll.groupVersion}`));
     commitments.append(text("p", "承诺用于标识已登记的成员资格，不包含姓名或身份秘密。此处展示演示成员数据。", "muted"));
+    const rootLine = text("p", "", "muted");
+    rootLine.append(text("span", "当前快照 Merkle 根："), text("code", poll.merkleRoot));
+    commitments.append(rootLine);
     poll.eligibleMemberCommitments.forEach(commitment => commitments.append(text("code", commitment)));
     detail.replaceChildren(heading, text("h2", poll.title), text("p", poll.description, "description"), text("p", `议题组织方 / ${poll.organizer}`, "organizer"), stats, text("h3", "议题方案"), options, commitments, voteSection(poll));
   } catch (error) { if (selected === id) detail.replaceChildren(text("p", error instanceof Error ? error.message : "暂时无法读取议题", "error")); }

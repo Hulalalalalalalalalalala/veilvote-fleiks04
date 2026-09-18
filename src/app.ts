@@ -1,10 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
-import { Group } from "@semaphore-protocol/group";
 import { verifyProof, type SemaphoreProof } from "@semaphore-protocol/proof";
-import { openCatalog } from "./store.ts";
-import { isProofPayload, terminateProverWorkers, textToField } from "./voting.ts";
+import { openCatalog, type GroupOperation } from "./store.ts";
+import { isCommitment, isProofPayload, terminateProverWorkers, textToField } from "./voting.ts";
 
 const MAX_BODY_BYTES = 1_000_000;
 
@@ -70,6 +69,28 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           const result = catalog.results(id);
           return result ? json(200, { result }) : json(404, { error: "poll_not_found" });
         }
+        if (segments[3] === "group") {
+          if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
+          if (!catalog.get(id)) return json(404, { error: "poll_not_found" });
+          let body: unknown;
+          try { body = JSON.parse(await readBody(request)); }
+          catch { return json(400, { error: "invalid_json" }); }
+          if (typeof body !== "object" || body === null) return json(400, { error: "invalid_group_operation" });
+          const { operation, expectedVersion, commitment, oldCommitment, newCommitment } = body as Record<string, unknown>;
+          if (!Number.isInteger(expectedVersion) || (expectedVersion as number) < 1) return json(400, { error: "invalid_group_operation" });
+          let groupOperation: GroupOperation;
+          if (operation === "join" && isCommitment(commitment)) groupOperation = { type: "join", commitment };
+          else if (operation === "rotate" && isCommitment(oldCommitment) && isCommitment(newCommitment)) groupOperation = { type: "rotate", oldCommitment, newCommitment };
+          else if (operation === "revoke" && isCommitment(commitment)) groupOperation = { type: "revoke", commitment };
+          else return json(400, { error: "invalid_group_operation" });
+          const outcome = catalog.applyGroupOperation(id, groupOperation, expectedVersion as number);
+          if (!outcome.ok) {
+            if (outcome.reason === "poll_missing") return json(404, { error: "poll_not_found" });
+            if (outcome.reason === "group_frozen" || outcome.reason === "group_version_changed") return json(409, { error: outcome.reason });
+            return json(400, { error: outcome.reason });
+          }
+          return json(201, { group: outcome.group });
+        }
         if (segments[3] === "votes") {
           if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
           const poll = catalog.get(id);
@@ -78,21 +99,35 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           try { body = JSON.parse(await readBody(request)); }
           catch { return json(400, { error: "invalid_json" }); }
           if (typeof body !== "object" || body === null) return json(400, { error: "invalid_vote" });
-          const { optionId, proof } = body as { optionId?: unknown; proof?: unknown };
+          const { optionId, proof, groupVersion } = body as { optionId?: unknown; proof?: unknown; groupVersion?: unknown };
           if (typeof optionId !== "string" || optionId.length === 0 || !isProofPayload(proof)) {
+            return json(400, { error: "invalid_vote" });
+          }
+          if (groupVersion !== undefined && (!Number.isInteger(groupVersion) || (groupVersion as number) < 1)) {
             return json(400, { error: "invalid_vote" });
           }
           if (!poll.options.some(option => option.id === optionId)) return json(400, { error: "unknown_option" });
           if (poll.status !== "open" || Date.now() >= Date.parse(poll.closesAt)) return json(409, { error: "poll_closed" });
-          // The proof must be bound to this poll (scope), the chosen option
-          // (message) and the current member tree (root) rebuilt from SQLite.
-          const group = new Group(catalog.memberCommitments());
+          // Resolve the immutable snapshot the proof must bind to: either the
+          // explicitly requested version, or the version whose Merkle root the
+          // proof carries (legacy clients that omit groupVersion). Historical
+          // versions conflict; unknown roots are unprocessable.
+          let snapshotVersion: number;
+          if (groupVersion !== undefined) {
+            if (groupVersion !== poll.groupVersion) return json(409, { error: "group_version_changed" });
+            if (proof.merkleTreeRoot !== poll.merkleRoot) return json(422, { error: "proof_binding_mismatch" });
+            snapshotVersion = groupVersion as number;
+          } else {
+            const snapshot = catalog.groupSnapshotByRoot(poll.id, proof.merkleTreeRoot);
+            if (!snapshot) return json(422, { error: "unknown_merkle_root" });
+            if (snapshot.version !== poll.groupVersion) return json(409, { error: "group_version_changed" });
+            snapshotVersion = snapshot.version;
+          }
+          // The proof must also be bound to this poll (scope) and the chosen
+          // option (message).
           let bound = false;
           try {
-            bound =
-              proof.scope === textToField(poll.id) &&
-              proof.message === textToField(optionId) &&
-              proof.merkleTreeRoot === group.root.toString();
+            bound = proof.scope === textToField(poll.id) && proof.message === textToField(optionId);
           } catch { bound = false; }
           if (!bound) return json(422, { error: "proof_binding_mismatch" });
           let valid = false;
@@ -100,9 +135,13 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           try { valid = await verifyProof(proof as unknown as SemaphoreProof); }
           catch { valid = false; }
           if (!valid) return json(422, { error: "invalid_proof" });
-          const outcome = catalog.commitVote(poll.id, optionId, proof.nullifier);
+          // Snapshot confirmation, freeze-on-first-vote, nullifier dedup and
+          // the vote write commit atomically; a concurrent group change makes
+          // exactly one of the two succeed.
+          const outcome = catalog.commitVote(poll.id, optionId, proof.nullifier, snapshotVersion);
           if (!outcome.ok) {
             if (outcome.reason === "duplicate_nullifier") return json(409, { error: "duplicate_nullifier" });
+            if (outcome.reason === "group_version_changed") return json(409, { error: "group_version_changed" });
             if (outcome.reason === "poll_closed") return json(409, { error: "poll_closed" });
             return json(400, { error: "unknown_option" });
           }
