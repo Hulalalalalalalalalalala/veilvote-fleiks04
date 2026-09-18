@@ -3,19 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.0.0 <25" },
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "dev:api": "node --watch src/server.ts",
     "build": "tsc --noEmit && vite build",
     "start": "node src/server.ts",
-    "test": "node --test test/catalog.test.ts",
+    "test": "node --test test/catalog.test.ts test/votes.test.ts",
     "demo": "node scripts/demo.ts"
   },
   "dependencies": {
     "@semaphore-protocol/group": "4.14.3",
     "@semaphore-protocol/identity": "4.14.3",
-    "@semaphore-protocol/proof": "4.14.3"
+    "@semaphore-protocol/proof": "4.14.3",
+    "snarkjs": "0.7.5"
   },
   "devDependencies": {
     "@types/node": "24.10.1",
