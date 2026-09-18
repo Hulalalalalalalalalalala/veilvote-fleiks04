@@ -15,3 +15,16 @@ export interface PollDetail extends PollSummary {
   options: PollOption[];
   eligibleMemberCommitments: string[];
 }
+export interface VoteReceipt {
+  id: string;
+  pollId: string;
+  optionId: string;
+  nullifier: string;
+  acceptedAt: string;
+}
+export interface PollOptionResult { id: string; count: number }
+export interface PollResult {
+  pollId: string;
+  total: number;
+  options: PollOptionResult[];
+}
