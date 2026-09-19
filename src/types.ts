@@ -40,10 +40,26 @@ export interface VoteReceipt {
   nullifier: string;
   acceptedAt: string;
 }
+/**
+ * Immutable tally captured in the same transaction that closes a poll. The
+ * field order is part of the contract: digest is the lowercase hex SHA-256 of
+ * the UTF-8 JSON.stringify of the first five fields, serialized in this order.
+ */
+export interface CloseSnapshot {
+  pollId: string;
+  groupVersion: number;
+  total: number;
+  options: { id: string; count: number }[];
+  /** UTC instant of the close, formatted YYYY-MM-DDTHH:mm:ss.sssZ. */
+  closedAt: string;
+  digest: string;
+}
 export interface PollResults {
   pollId: string;
   total: number;
   options: { id: string; count: number }[];
+  /** Present on closed/archived polls only; open polls have none. */
+  snapshot?: CloseSnapshot;
 }
 /** Administrative actions recorded in the audit trail. */
 export type AuditAction =
@@ -61,4 +77,21 @@ export interface AuditEvent {
   at: string;
   /** Action-specific, non-sensitive context (never the token, secrets or proofs). */
   details: Record<string, unknown>;
+}
+/** Filters for the paginated audit query; from/to are inclusive ISO8601 bounds. */
+export interface AuditQuery {
+  pollId?: string;
+  action?: AuditAction;
+  result?: "success" | "failure";
+  from?: string;
+  to?: string;
+  page: number;
+  pageSize: number;
+}
+export interface AuditPage {
+  events: AuditEvent[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
 }

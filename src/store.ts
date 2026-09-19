@@ -1,10 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Group } from "@semaphore-protocol/group";
 import type {
-  AuditAction, AuditEvent, GroupVersionSummary, PollDetail, PollResults, PollStatus, PollSummary, VoteReceipt
+  AuditAction, AuditEvent, AuditPage, AuditQuery, CloseSnapshot, GroupVersionSummary, PollDetail, PollResults, PollStatus, PollSummary, VoteReceipt
 } from "./types.ts";
 
 interface SeedPoll extends Omit<PollDetail, "memberCount" | "optionCount" | "eligibleMemberCommitments" | "groupVersion" | "merkleRoot"> {}
@@ -17,6 +17,7 @@ interface PollRow {
 interface GroupVersionRow { poll_id: string; version: number; commitments_json: string; merkle_root: string; created_at: string }
 interface VoteRow { id: string; poll_id: string; option_id: string; nullifier: string; accepted_at: string }
 interface AuditRow { id: string; action: AuditAction; poll_id: string; result: "success" | "failure"; at: string; details_json: string }
+interface CloseSnapshotRow { poll_id: string; group_version: number; total: number; options_json: string; closed_at: string; digest: string }
 
 export interface GroupSnapshot { version: number; commitments: string[]; merkleRoot: string }
 export type GroupOperation =
@@ -68,6 +69,30 @@ function toAuditEvent(row: AuditRow): AuditEvent {
 function merkleRootOf(commitments: string[]): string {
   return new Group(commitments).root.toString();
 }
+/** Normalize any parseable timestamp to the snapshot's UTC YYYY-MM-DDTHH:mm:ss.sssZ shape. */
+function toCloseIso(value: string): string {
+  return new Date(Date.parse(value)).toISOString();
+}
+/**
+ * Builds the immutable close snapshot for a poll row. The digest commits to
+ * the JSON.stringify of the first five fields in their contractual order
+ * (pollId, groupVersion, total, options, closedAt), UTF-8 encoded, hashed
+ * with SHA-256 and rendered as lowercase hex. Counts and totals are plain
+ * JSON numbers and options follow the poll's own option order.
+ */
+function buildCloseSnapshot(row: PollRow, counts: ReadonlyMap<string, number>, closedAt: string): CloseSnapshot {
+  const options = (JSON.parse(row.options_json) as { id: string }[]).map(option => ({ id: option.id, count: counts.get(option.id) ?? 0 }));
+  const head = { pollId: row.id, groupVersion: row.group_version, total: options.reduce((sum, option) => sum + option.count, 0), options, closedAt };
+  const digest = createHash("sha256").update(JSON.stringify(head), "utf8").digest("hex");
+  return { ...head, digest };
+}
+function toCloseSnapshot(row: CloseSnapshotRow): CloseSnapshot {
+  return {
+    pollId: row.poll_id, groupVersion: row.group_version, total: row.total,
+    options: JSON.parse(row.options_json) as { id: string; count: number }[],
+    closedAt: row.closed_at, digest: row.digest
+  };
+}
 
 export function openCatalog(databasePath: string) {
   if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
@@ -109,6 +134,14 @@ export function openCatalog(databasePath: string) {
       details_json TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS audit_events_time ON audit_events (at DESC, id DESC);
+    CREATE TABLE IF NOT EXISTS close_snapshots (
+      poll_id TEXT PRIMARY KEY REFERENCES polls (id),
+      group_version INTEGER NOT NULL,
+      total INTEGER NOT NULL,
+      options_json TEXT NOT NULL,
+      closed_at TEXT NOT NULL,
+      digest TEXT NOT NULL
+    );
   `);
   // Migrate pre-versioning databases: add the group columns to existing polls.
   const pollColumns = new Set((db.prepare("PRAGMA table_info(polls)").all() as { name: string }[]).map(column => column.name));
@@ -152,6 +185,27 @@ export function openCatalog(databasePath: string) {
       } catch (error) { db.exec("ROLLBACK"); db.close(); throw error; }
     }
   }
+  // One-time backfill: polls that closed (or archived) before close snapshots
+  // existed get theirs reconstructed here. The version takes the current
+  // value, counts come from the stored votes, and closedAt falls back from
+  // the successful close audit time to the last vote's acceptedAt to
+  // closesAt, taking the first available. Once written it never changes.
+  const missingSnapshots = db.prepare("SELECT * FROM polls WHERE status IN ('closed', 'archived') AND id NOT IN (SELECT poll_id FROM close_snapshots)").all() as unknown as PollRow[];
+  if (missingSnapshots.length > 0) {
+    db.exec("BEGIN");
+    try {
+      for (const row of missingSnapshots) {
+        const closeAudit = (db.prepare("SELECT at, details_json FROM audit_events WHERE poll_id = ? AND action = 'poll_status_change' AND result = 'success' ORDER BY at ASC, id ASC").all(row.id) as { at: string; details_json: string }[])
+          .find(event => {
+            try { return (JSON.parse(event.details_json) as { to?: unknown }).to === "closed"; }
+            catch { return false; }
+          });
+        const lastVote = db.prepare("SELECT MAX(accepted_at) AS last FROM votes WHERE poll_id = ?").get(row.id) as { last: string | null };
+        persistCloseSnapshotLocked(row, toCloseIso(closeAudit?.at ?? lastVote.last ?? row.closes_at));
+      }
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); db.close(); throw error; }
+  }
 
   /** Insert an audit row. Must be called inside an open transaction. */
   function insertAudit(action: AuditAction, pollId: string, result: "success" | "failure", details: Record<string, unknown>, atIso: string) {
@@ -167,6 +221,29 @@ export function openCatalog(databasePath: string) {
   }
   function pollRow(id: string): PollRow | undefined {
     return db.prepare("SELECT * FROM polls WHERE id = ?").get(id) as PollRow | undefined;
+  }
+  /** Per-option tallies for a poll, keyed by option id. */
+  function voteCounts(pollId: string): Map<string, number> {
+    return new Map(
+      (db.prepare("SELECT option_id, count(*) AS count FROM votes WHERE poll_id = ? GROUP BY option_id").all(pollId) as { option_id: string; count: number }[])
+        .map(entry => [entry.option_id, entry.count])
+    );
+  }
+  /**
+   * Writes the close snapshot for a poll being closed. Must be called inside
+   * the same transaction as the status change so the two commit (or roll
+   * back) together; INSERT OR IGNORE makes a repeated close a no-op, keeping
+   * the first snapshot immutable across archiving and restarts.
+   */
+  function persistCloseSnapshotLocked(row: PollRow, closedAt: string) {
+    const snapshot = buildCloseSnapshot(row, voteCounts(row.id), closedAt);
+    db.prepare("INSERT OR IGNORE INTO close_snapshots (poll_id, group_version, total, options_json, closed_at, digest) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(snapshot.pollId, snapshot.groupVersion, snapshot.total, JSON.stringify(snapshot.options), snapshot.closedAt, snapshot.digest);
+  }
+  /** The persisted close snapshot, if the poll has one. */
+  function closeSnapshot(pollId: string): CloseSnapshot | undefined {
+    const row = db.prepare("SELECT * FROM close_snapshots WHERE poll_id = ?").get(pollId) as CloseSnapshotRow | undefined;
+    return row ? toCloseSnapshot(row) : undefined;
   }
   /**
    * Lazily persists the deadline transition for every open poll whose
@@ -184,7 +261,11 @@ export function openCatalog(databasePath: string) {
       const at = new Date(now).toISOString();
       for (const pollId of due) {
         const result = db.prepare("UPDATE polls SET status = 'closed' WHERE id = ? AND status = 'open'").run(pollId);
-        if (result.changes > 0) insertAudit("poll_status_change", pollId, "success", { from: "open", to: "closed", reason: "deadline" }, at);
+        if (result.changes > 0) {
+          insertAudit("poll_status_change", pollId, "success", { from: "open", to: "closed", reason: "deadline" }, at);
+          const row = pollRow(pollId);
+          if (row) persistCloseSnapshotLocked(row, at);
+        }
       }
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
@@ -275,6 +356,8 @@ export function openCatalog(databasePath: string) {
         const at = new Date(now).toISOString();
         db.prepare("UPDATE polls SET status = ? WHERE id = ?").run(target, pollId);
         insertAudit("poll_status_change", pollId, "success", { from: row.status, to: target }, at);
+        // A manual close captures its tally snapshot in the same transaction.
+        if (target === "closed") persistCloseSnapshotLocked(row, at);
         db.exec("COMMIT");
         return { ok: true, status: target };
       } catch (error) {
@@ -328,6 +411,7 @@ export function openCatalog(databasePath: string) {
           const at = new Date(now).toISOString();
           db.prepare("UPDATE polls SET status = 'closed' WHERE id = ?").run(pollId);
           insertAudit("poll_status_change", pollId, "success", { from: "open", to: "closed", reason: "deadline" }, at);
+          persistCloseSnapshotLocked(row, at);
           insertAudit("group_change_rejected", pollId, "failure", { operation: operation.type, expectedVersion, reason: "poll_not_editable", status: "closed", deadline: true }, at);
           db.exec("COMMIT");
           return { ok: false, reason: "poll_not_editable" };
@@ -386,6 +470,7 @@ export function openCatalog(databasePath: string) {
           const at = new Date(now).toISOString();
           db.prepare("UPDATE polls SET status = 'closed' WHERE id = ?").run(pollId);
           insertAudit("poll_status_change", pollId, "success", { from: "open", to: "closed", reason: "deadline" }, at);
+          persistCloseSnapshotLocked(row, at);
           db.exec("COMMIT");
           return { ok: false, reason: "poll_closed" };
         }
@@ -411,12 +496,16 @@ export function openCatalog(databasePath: string) {
       closeExpired(now);
       const row = pollRow(pollId);
       if (!row || row.status === "draft") return undefined;
-      const counts = new Map(
-        (db.prepare("SELECT option_id, count(*) AS count FROM votes WHERE poll_id = ? GROUP BY option_id").all(pollId) as { option_id: string; count: number }[])
-          .map(entry => [entry.option_id, entry.count])
-      );
+      const counts = voteCounts(pollId);
       const options = (JSON.parse(row.options_json) as { id: string }[]).map(option => ({ id: option.id, count: counts.get(option.id) ?? 0 }));
-      return { pollId, total: options.reduce((sum, option) => sum + option.count, 0), options };
+      const result: PollResults = { pollId, total: options.reduce((sum, option) => sum + option.count, 0), options };
+      // Closed and archived polls carry the immutable snapshot captured at
+      // close time; open polls have none.
+      if (row.status === "closed" || row.status === "archived") {
+        const snapshot = closeSnapshot(pollId);
+        if (snapshot) result.snapshot = snapshot;
+      }
+      return result;
     },
     receipt(id: string): VoteReceipt | undefined {
       const row = db.prepare("SELECT * FROM votes WHERE id = ?").get(id) as VoteRow | undefined;
@@ -426,6 +515,30 @@ export function openCatalog(databasePath: string) {
     auditEvents(limit = 200): AuditEvent[] {
       const rows = db.prepare("SELECT * FROM audit_events ORDER BY at DESC, id DESC LIMIT ?").all(limit) as unknown as AuditRow[];
       return rows.map(toAuditEvent);
+    },
+    /**
+     * Filtered, paginated audit query, newest first. from/to are inclusive
+     * ISO8601 bounds on the event time; pageSize is capped by the caller.
+     */
+    queryAuditEvents(query: AuditQuery): AuditPage {
+      const where: string[] = [];
+      const args: string[] = [];
+      if (query.pollId !== undefined) { where.push("poll_id = ?"); args.push(query.pollId); }
+      if (query.action !== undefined) { where.push("action = ?"); args.push(query.action); }
+      if (query.result !== undefined) { where.push("result = ?"); args.push(query.result); }
+      if (query.from !== undefined) { where.push("at >= ?"); args.push(query.from); }
+      if (query.to !== undefined) { where.push("at <= ?"); args.push(query.to); }
+      const clause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+      const total = (db.prepare(`SELECT count(*) AS count FROM audit_events ${clause}`).get(...args) as { count: number }).count;
+      const rows = db.prepare(`SELECT * FROM audit_events ${clause} ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`)
+        .all(...args, query.pageSize, (query.page - 1) * query.pageSize) as unknown as AuditRow[];
+      return {
+        events: rows.map(toAuditEvent),
+        total,
+        page: query.page,
+        pageSize: query.pageSize,
+        totalPages: Math.ceil(total / query.pageSize)
+      };
     },
     close() { db.close(); }
   };

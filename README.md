@@ -20,10 +20,14 @@ npm start
 
 - `draft`（草稿）：由 `POST /api/polls` 创建。不进入公共列表，普通详情、结果与投票均返回 404；只有携带正确 `X-Admin-Token` 的管理员能看到并管理它，此阶段可任意调整成员名单。
 - `open`（投票中）：`draft → open` 后对公众可见、可投票。成员名单仅在**尚未投出任何选票**时可变更；首张有效选票在同一事务内冻结当前版本，此后变更返回 `409 group_frozen`。
-- `closed`（已截止）：到 `closesAt` 时，下一次读取或投票会在事务中**原子地持久化** `closed`；越界（截止时刻及之后）的选票被拒绝，并发投票由事务状态裁决，且只记录一次截止转换。也可由管理员 `open → closed` 手动截止。
-- `archived`（已归档）：终态。`closed/archived` 均不再接受投票或成员变更，但结果继续公开可查。
+- `closed`（已截止）：到 `closesAt` 时，下一次读取或投票会在事务中**原子地持久化** `closed`；越界（截止时刻及之后）的选票被拒绝，并发投票由事务状态裁决，且只记录一次截止转换。也可由管理员 `open → closed` 手动截止。无论手动还是到期，关闭都会在与状态变更**同一事务**内写入不可变的结果快照（见下文「关闭快照」）。
+- `archived`（已归档）：终态。`closed/archived` 均不再接受投票或成员变更，但结果继续公开可查；归档与重启都不改变关闭快照。
 
-旧数据库中的议题迁移为 `open`，既有查询、投票、回执与旧版成员快照完全兼容。
+旧数据库中的议题迁移为 `open`，既有查询、投票、回执与旧版成员快照完全兼容。旧库中已 `closed/archived` 但缺少关闭快照的议题会在首次启动时**回填一次**：版本取当前值、计数取既有选票，`closedAt` 依次取成功关闭审计时间 → 末票 `acceptedAt` → `closesAt` 的首个可用值，写入后即固定。
+
+## 关闭快照
+
+议题关闭（手动或到期）时，与状态变更同一事务写入快照 `{ pollId, groupVersion, total, options, closedAt, digest }`：字段依此顺序序列化；`groupVersion` 取关闭当时值；`options` 按议题选项顺序列出 `{ id, count }`，整数为 JSON 数字；`closedAt` 为 UTC `YYYY-MM-DDTHH:mm:ss.sssZ`；`digest` 为前五个字段经 `JSON.stringify`、UTF-8 编码、SHA-256 后的小写十六进制。快照持久化于 SQLite（`close_snapshots` 表），归档与重启均不改变。
 
 ## 接口
 
@@ -34,9 +38,10 @@ npm start
 - `POST /api/polls/:id/status`（**需令牌**）：提交 `{ status, expectedStatus }`，仅允许 `draft→open→closed→archived` 的相邻转换。成功返回 200 与 `{ status, poll }`；议题不存在 404；状态值非法 400 `invalid_status`；`expectedStatus` 与当前状态冲突 409 `status_conflict`；非法转换（跳级或终态再转）409 `illegal_transition`。
 - `POST /api/polls/:id/group`（**需令牌**）：变更成员名单，提交 `{ operation, expectedVersion, ... }`。`join` 携带 `commitment` 追加成员；`rotate` 携带 `oldCommitment` 与 `newCommitment` 原位替换；`revoke` 携带 `commitment` 移除成员。每次成功变更都会持久化一个不可变的新版本（承诺列表 + Merkle 根 + 递增版本号）并返回 201 与 `{ group: { pollId, version, merkleRoot, memberCount, commitments } }`。议题不存在 404；报文格式非法、目标承诺不存在、承诺重复或变更后名单为空 400；`expectedVersion` 过期 409 `group_version_changed`；议题已有选票（名单已冻结）409 `group_frozen`；议题不在可编辑状态（非 draft/open）409 `poll_not_editable`。仅 draft 或未投票的 open 可变更。
 - `POST /api/polls/:id/votes`：提交 `{ optionId, proof }`（Semaphore v4 证明，message 为选项 id、scope 为议题 id），可附带 `groupVersion` 声明所基于的成员版本；省略时按证明的 Merkle 根解析版本以兼容旧客户端。成功返回 201 与 `{ receipt: { id, pollId, optionId, nullifier, acceptedAt } }`，首张选票会在同一事务中冻结当前版本。议题不存在或为草稿 404；报文格式或选项非法 400；证明无效或被篡改（message/scope/merkle 根不匹配）、证明根不属于任何已知版本 422；议题非 open 或已过 `closesAt`、同一 nullifier 重复投票（跨版本去重）、版本已过期 409（分别为 `poll_closed`、`duplicate_nullifier`、`group_version_changed`）。
-- `GET /api/polls/:id/results`：`{ result: { pollId, total, options: [{ id, count }] } }`，零票选项也会列出；open/closed/archived 公开，草稿与不存在返回 404。
+- `GET /api/polls/:id/results`：`{ result: { pollId, total, options: [{ id, count }] } }`，零票选项也会列出；`closed/archived` 额外携带 `snapshot`（关闭快照），`open` 无此字段，草稿与不存在返回 404。
 - `GET /api/receipts/:id`：返回 `{ receipt: {...} }`；未知回执返回 404。
-- `GET /api/admin/audit`（**需令牌**）：`{ events: [...] }`，审计事件按时间倒序返回。
+- `POST /api/receipts/:id/verify`：提交 `{ pollId, optionId, nullifier }` 核对回执。回执未知返回 404；任一字段不符返回 422 `receipt_mismatch`；全部相符返回 200 与 `{ valid: true, receipt }`。核对只比较调用方已知的公开回执字段，不触碰承诺或身份数据。
+- `GET /api/admin/audit`（**需令牌**）：按时间倒序返回 `{ events, total, page, pageSize, totalPages }`。查询参数：`pollId`、`action`、`result`（精确匹配过滤），`from`/`to`（ISO8601，含端点；非法或倒置返回 400），`page`（默认 1）与 `pageSize`（默认 50、上限 200）。
 
 ## 审计
 
