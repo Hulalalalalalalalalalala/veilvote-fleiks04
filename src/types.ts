@@ -1,10 +1,12 @@
+export type PollStatus = "draft" | "open" | "closed" | "archived";
+
 export interface PollOption { id: string; label: string }
 export interface PollSummary {
   id: string;
   title: string;
   summary: string;
   organizer: string;
-  status: "open";
+  status: PollStatus;
   publishedAt: string;
   closesAt: string;
   memberCount: number;
@@ -43,4 +45,18 @@ export interface PollResults {
   pollId: string;
   total: number;
   options: { id: string; count: number }[];
+}
+export type AuditAction =
+  | "poll_created"
+  | "status_changed"
+  | "members_changed"
+  | "vote_accepted"
+  | "vote_rejected";
+export interface AuditEvent {
+  id: string;
+  at: string;
+  action: AuditAction;
+  pollId: string | null;
+  result: "success" | "failure";
+  detail: Record<string, unknown>;
 }

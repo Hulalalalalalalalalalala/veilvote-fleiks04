@@ -26,7 +26,7 @@ test("catalog persists its two seeded polls and eight distinct commitments", () 
 });
 
 test("HTTP API exposes catalog details and clear errors", async () => {
-  const server = createApp(":memory:");
+  const server = createApp(":memory:", undefined, "catalog-token");
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
   const address = server.address();
   assert.ok(address && typeof address !== "string");
@@ -38,9 +38,14 @@ test("HTTP API exposes catalog details and clear errors", async () => {
     assert.equal(detail.poll.eligibleMemberCommitments.length, 8);
     assert.equal((await fetch(`${base}/api/polls/missing`)).status, 404);
     assert.equal((await fetch(`${base}/api/polls/%E0%A4%A`)).status, 400);
+    // POST /api/polls creates drafts and requires an admin token.
     const write = await fetch(`${base}/api/polls`, { method: "POST" });
-    assert.equal(write.status, 405);
-    assert.equal(write.headers.get("allow"), "GET");
+    assert.equal(write.status, 401);
+    assert.equal(((await write.json()) as { error: string }).error, "admin_unauthorized");
+    // An unrelated method on a sub-resource is still 405.
+    const deletePoll = await fetch(`${base}/api/polls/${list.polls[0].id}`, { method: "DELETE" });
+    assert.equal(deletePoll.status, 405);
+    assert.equal(deletePoll.headers.get("allow"), "GET");
   } finally {
     server.closeAllConnections();
     await new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done()));

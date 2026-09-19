@@ -16,8 +16,9 @@ import type { GroupVersionSummary, PollDetail, SemaphoreProofPayload, VoteReceip
 // Release the snarkjs worker pool so the test process can exit.
 test.after(() => terminateProverWorkers());
 
+const ADMIN_TOKEN = "test-admin-token";
 async function serve(databasePath: string): Promise<{ server: Server; base: string }> {
-  const server = createApp(databasePath);
+  const server = createApp(databasePath, undefined, ADMIN_TOKEN);
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
   const address = server.address();
   assert.ok(address && typeof address !== "string");
@@ -32,10 +33,12 @@ async function pollDetail(base: string, id: string): Promise<PollDetail> {
   assert.equal(response.status, 200);
   return ((await response.json()) as { poll: PollDetail }).poll;
 }
-async function postGroup(base: string, pollId: string, payload: unknown) {
+async function postGroup(base: string, pollId: string, payload: unknown, token?: string) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token !== "") headers["X-Admin-Token"] = token ?? ADMIN_TOKEN;
   const response = await fetch(`${base}/api/polls/${encodeURIComponent(pollId)}/group`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers },
     body: typeof payload === "string" ? payload : JSON.stringify(payload)
   });
   return { status: response.status, body: await response.json() as { group?: GroupVersionSummary; error?: string } };
@@ -54,6 +57,51 @@ async function proofFor(secret: string, optionId: string, poll: PollDetail, comm
   return generateProof(identity, group, optionId, poll.id) as Promise<SemaphoreProofPayload>;
 }
 const commitmentOf = (secret: string) => new Identity(secret).commitment.toString();
+
+test("member changes require a valid admin token and write nothing when unauthorized", async () => {
+  // No ADMIN_TOKEN configured: every admin request is rejected.
+  const locked = createApp(":memory:");
+  await new Promise<void>(done => locked.listen(0, "127.0.0.1", done));
+  const lockedAddress = locked.address();
+  assert.ok(lockedAddress && typeof lockedAddress !== "string");
+  const lockedBase = `http://127.0.0.1:${lockedAddress.port}`;
+  try {
+    const payload = { operation: "join", expectedVersion: 1, commitment: commitmentOf("veilvote-demo-member-09") };
+    const headerSets: Record<string, string>[] = [
+      {},
+      { "X-Admin-Token": "wrong-token" }
+    ];
+    for (const headers of headerSets) {
+      const response = await fetch(`${lockedBase}/api/polls/community-garden-autumn/group`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(payload)
+      });
+      assert.equal(response.status, 401);
+      assert.equal(((await response.json()) as { error: string }).error, "admin_unauthorized");
+    }
+    // No audit event and no new version were written by the failed attempts.
+    const audit = await fetch(`${lockedBase}/api/admin/audit`, { headers: { "X-Admin-Token": "anything" } });
+    assert.equal(audit.status, 401);
+  } finally {
+    locked.closeAllConnections();
+    await new Promise<void>((done, reject) => locked.close(error => error ? reject(error) : done()));
+  }
+
+  const { server, base } = await serve(":memory:");
+  try {
+    const poll = await pollDetail(base, "community-garden-autumn");
+    // Missing header against a configured service is also 401.
+    const without = await postGroup(base, poll.id, { operation: "join", expectedVersion: 1, commitment: commitmentOf("veilvote-demo-member-09") }, "");
+    assert.equal(without.status, 401);
+    // Wrong token.
+    const wrong = await postGroup(base, poll.id, { operation: "join", expectedVersion: 1, commitment: commitmentOf("veilvote-demo-member-09") }, "nope");
+    assert.equal(wrong.status, 401);
+    // The poll is untouched: still version 1.
+    const unchanged = await pollDetail(base, poll.id);
+    assert.equal(unchanged.groupVersion, 1);
+  } finally {
+    await stop(server);
+  }
+});
 
 test("group operations create immutable, validated versions", async () => {
   const { server, base } = await serve(":memory:");
