@@ -44,6 +44,22 @@ export interface PollResults {
   pollId: string;
   total: number;
   options: { id: string; count: number }[];
+  /** Present once the poll is closed (and kept through archived); open polls have none. */
+  snapshot?: PollSnapshot;
+}
+/**
+ * Immutable tally captured in the same transaction that closes a poll. The
+ * digest is the lowercase hex SHA-256 of the UTF-8 bytes of JSON.stringify of
+ * the first five fields, serialized in this exact order.
+ */
+export interface PollSnapshot {
+  pollId: string;
+  groupVersion: number;
+  total: number;
+  options: { id: string; count: number }[];
+  /** UTC instant of the close, formatted YYYY-MM-DDTHH:mm:ss.sssZ. */
+  closedAt: string;
+  digest: string;
 }
 /** Administrative actions recorded in the audit trail. */
 export type AuditAction =
@@ -61,4 +77,12 @@ export interface AuditEvent {
   at: string;
   /** Action-specific, non-sensitive context (never the token, secrets or proofs). */
   details: Record<string, unknown>;
+}
+/** One page of the audit trail, newest first. */
+export interface AuditPage {
+  events: AuditEvent[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
 }

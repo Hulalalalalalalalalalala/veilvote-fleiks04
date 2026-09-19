@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { verifyProof, type SemaphoreProof } from "@semaphore-protocol/proof";
-import { openCatalog, STATUSES, type GroupOperation, type NewPollInput } from "./store.ts";
+import { openCatalog, STATUSES, type AuditQuery, type GroupOperation, type NewPollInput } from "./store.ts";
 import { isCommitment, isProofPayload, terminateProverWorkers, textToField } from "./voting.ts";
 import type { AuditEvent, PollStatus } from "./types.ts";
 
@@ -88,7 +88,9 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
       if (segments[1] === "admin" && segments[2] === "audit" && segments.length === 3) {
         if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
         if (!requireAdmin()) return;
-        return json(200, { events: catalog.auditEvents() });
+        const query = parseAuditQuery(url.searchParams);
+        if (!query.ok) return json(400, { error: query.error });
+        return json(200, catalog.auditQuery(query.query));
       }
       if (segments[1] === "polls" && segments.length <= 4) {
         if (segments.length === 2) {
@@ -260,6 +262,28 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
         const receipt = catalog.receipt(id);
         return receipt ? json(200, { receipt }) : json(404, { error: "receipt_not_found" });
       }
+      if (segments[1] === "receipts" && segments.length === 4 && segments[3] === "verify") {
+        // A voter proves their ballot was counted by presenting the receipt's
+        // own public fields; nothing here links the receipt to an identity.
+        if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
+        let id: string;
+        try { id = decodeURIComponent(segments[2]); }
+        catch { return json(400, { error: "invalid_receipt_id" }); }
+        let body: unknown;
+        try { body = JSON.parse(await readBody(request)); }
+        catch { return json(400, { error: "invalid_json" }); }
+        if (typeof body !== "object" || body === null) return json(400, { error: "invalid_verification" });
+        const { pollId, optionId, nullifier } = body as Record<string, unknown>;
+        if (typeof pollId !== "string" || typeof optionId !== "string" || typeof nullifier !== "string") {
+          return json(400, { error: "invalid_verification" });
+        }
+        const receipt = catalog.receipt(id);
+        if (!receipt) return json(404, { error: "receipt_not_found" });
+        if (receipt.pollId !== pollId || receipt.optionId !== optionId || receipt.nullifier !== nullifier) {
+          return json(422, { error: "receipt_mismatch" });
+        }
+        return json(200, { valid: true, receipt });
+      }
       return json(404, { error: "not_found" });
     }
     if (request.method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
@@ -275,6 +299,54 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
 
 function isStatus(value: unknown): value is PollStatus {
   return typeof value === "string" && (STATUSES as readonly string[]).includes(value);
+}
+
+const DEFAULT_AUDIT_PAGE_SIZE = 50;
+const MAX_AUDIT_PAGE_SIZE = 200;
+
+type ParseAuditQueryResult =
+  | { ok: true; query: AuditQuery }
+  | { ok: false; error: string };
+
+/**
+ * Validates the audit trail filters. from/to must be ISO8601 instants and are
+ * inclusive at both ends; an unparseable value or an inverted range is a 400.
+ * pageSize defaults to 50 and is capped at 200.
+ */
+function parseAuditQuery(params: URLSearchParams): ParseAuditQueryResult {
+  const query: AuditQuery = { page: 1, pageSize: DEFAULT_AUDIT_PAGE_SIZE };
+  const from = params.get("from");
+  const to = params.get("to");
+  if (from !== null) {
+    if (!isIsoDate(from)) return { ok: false, error: "invalid_time_range" };
+    query.from = new Date(Date.parse(from)).toISOString();
+  }
+  if (to !== null) {
+    if (!isIsoDate(to)) return { ok: false, error: "invalid_time_range" };
+    query.to = new Date(Date.parse(to)).toISOString();
+  }
+  if (query.from !== undefined && query.to !== undefined && query.from > query.to) {
+    return { ok: false, error: "invalid_time_range" };
+  }
+  const pollId = params.get("pollId");
+  if (pollId !== null) query.pollId = pollId;
+  const action = params.get("action");
+  if (action !== null) query.action = action;
+  const result = params.get("result");
+  if (result !== null) query.result = result;
+  const page = params.get("page");
+  if (page !== null) {
+    const parsed = Number(page);
+    if (!Number.isInteger(parsed) || parsed < 1) return { ok: false, error: "invalid_pagination" };
+    query.page = parsed;
+  }
+  const pageSize = params.get("pageSize");
+  if (pageSize !== null) {
+    const parsed = Number(pageSize);
+    if (!Number.isInteger(parsed) || parsed < 1) return { ok: false, error: "invalid_pagination" };
+    query.pageSize = Math.min(parsed, MAX_AUDIT_PAGE_SIZE);
+  }
+  return { ok: true, query };
 }
 
 type ParsePollResult =
