@@ -264,6 +264,32 @@ test("audit query filters, paginates and validates the time range", async () => 
       assert.equal((await audit("?to=2026-13-01T00:00:00Z")).status, 400);
       assert.equal((await audit("?from=2026-09-20T00:00:00Z&to=2026-09-19T00:00:00Z")).status, 400);
 
+      // Only strict timezone-aware ISO 8601 instants pass: values Date.parse
+      // accepts loosely are rejected outright.
+      const loose = [
+        "2026-09-20",                                  // date-only
+        "2026-09-20 10:00:00Z",                       // space separator
+        "2026-09-20T10:00:00",                        // no time zone
+        "2026-09-20T10:00Z",                          // no seconds
+        "2026/09/20T10:00:00Z",                       // wrong separator
+        "2026-02-29T00:00:00Z",                       // impossible calendar date (2026 is common)
+        "2026-04-31T00:00:00Z",                       // April has 30 days
+        "2026-09-20T24:00:00Z",                       // out-of-range hour
+        "Tue Sep 20 2026 10:00:00 GMT",               // free-form Date.parse text
+        "2026-09-20T10:00:00+24:00"                   // out-of-range offset
+      ];
+      for (const value of loose) {
+        assert.equal((await audit(`?from=${encodeURIComponent(value)}`)).status, 400, `from=${value}`);
+        assert.equal((await audit(`?to=${encodeURIComponent(value)}`)).status, 400, `to=${value}`);
+      }
+
+      // Explicit non-UTC offsets are accepted and normalized to the same UTC
+      // instant; the pivot event stays reachable through the offset bound.
+      const pivotOffset = pivot.replace("Z", "+00:00");
+      const viaOffset = await audit(`?from=${encodeURIComponent(pivotOffset)}`);
+      assert.equal(viaOffset.status, 200);
+      assert.ok(viaOffset.body.events.some(event => event.at === pivot));
+
       // Pagination: pageSize capped at 200, pages line up with the total.
       const capped = await audit("?pageSize=500");
       assert.equal(capped.body.pageSize, 200);

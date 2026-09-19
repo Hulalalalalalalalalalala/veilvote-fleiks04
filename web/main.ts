@@ -44,14 +44,27 @@ function date(value: string) { return new Intl.DateTimeFormat("zh-CN", { year: "
 function dateTime(value: string) { return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Shanghai" }).format(new Date(value)); }
 function isAdmin(): boolean { return adminToken.length > 0; }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers);
-  // Attach the in-memory token to every request while management mode is on.
-  if (isAdmin()) headers.set("X-Admin-Token", adminToken);
-  const response = await fetch(path, { ...init, headers });
+async function request<T>(path: string, init: RequestInit & { admin?: boolean } = {}): Promise<T> {
+  const { admin = true, ...fetchInit } = init;
+  const headers = new Headers(fetchInit.headers);
+  // Attach the in-memory token to every request while management mode is on;
+  // public endpoints (receipt verification) are called without it.
+  if (admin && isAdmin()) headers.set("X-Admin-Token", adminToken);
+  const response = await fetch(path, { ...fetchInit, headers });
   const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
   if (!response.ok) throw Object.assign(new Error(`请求失败（${response.status}）`), { status: response.status, body });
   return body as T;
+}
+
+/**
+ * A fetch failure (offline, DNS, connection refused) rather than an HTTP
+ * error response. Duck-typed rather than `instanceof TypeError` so errors from
+ * another realm (embedded views, test runtimes) are still recognized.
+ */
+function isNetworkFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || "status" in error) return false;
+  const name = (error as { name?: unknown }).name;
+  return name === "TypeError" || name === undefined;
 }
 
 const ERROR_TEXT: Record<string, string> = {
@@ -89,17 +102,94 @@ function statusBadge(status: PollStatus): HTMLElement {
   return text("span", STATUS_LABEL[status], `status-badge status-${status}`);
 }
 
+/**
+ * Canonical, copyable snapshot text. Field order matches the server's digest
+ * input (pollId, groupVersion, total, options, closedAt, digest); options use
+ * the poll's own order, which is the order captured in the snapshot.
+ */
+function snapshotSummary(result: PollResults): string {
+  const snapshot = result.snapshot!;
+  const lines = [
+    `pollId: ${snapshot.pollId}`,
+    `groupVersion: ${snapshot.groupVersion}`,
+    `total: ${snapshot.total}`,
+    ...snapshot.options.map(option => `options.${option.id}: ${option.count}`),
+    `closedAt: ${snapshot.closedAt}`,
+    `digest: ${snapshot.digest}`
+  ];
+  return lines.join("\n");
+}
+
 function resultsBlock(result: PollResults, poll: PollDetail): HTMLElement {
   const wrapper = text("div", "", "results");
-  wrapper.append(text("h3", poll.status === "open" ? `当前结果 · 共 ${result.total} 票` : `最终结果 · 共 ${result.total} 票`));
+  const snapshot = result.snapshot;
+  wrapper.append(text("h3", snapshot ? `最终结果 · 共 ${snapshot.total} 票（关闭时定格）` : `当前结果 · 共 ${result.total} 票`));
+  // Closed/archived: counts come from the immutable snapshot; open: the live
+  // tally. Both iterate the poll's option order (equal to the snapshot order).
+  const counts = snapshot ? snapshot.options : result.options;
   const labels = new Map(poll.options.map(option => [option.id, option.label]));
   const listElement = document.createElement("ul");
-  for (const option of result.options) {
+  for (const option of counts) {
     const item = document.createElement("li");
     item.append(text("span", labels.get(option.id) ?? option.id), text("strong", `${option.count} 票`));
     listElement.append(item);
   }
   wrapper.append(listElement);
+
+  if (snapshot) {
+    const meta = text("dl", "", "snapshot-meta");
+    for (const [label, value] of [
+      ["关闭时刻", dateTime(snapshot.closedAt)],
+      ["UTC", snapshot.closedAt],
+      ["成员版本", `v${snapshot.groupVersion}`],
+      ["总票数", String(snapshot.total)]
+    ] as [string, string][]) {
+      meta.append(text("dt", label), text("dd", value));
+    }
+    wrapper.append(meta);
+
+    const digestLine = text("p", "", "snapshot-digest");
+    digestLine.append(text("span", "摘要 SHA-256："), text("code", snapshot.digest));
+    wrapper.append(digestLine);
+
+    // The canonical summary is always present as selectable text; the copy
+    // button is a progressive enhancement (clipboard API may be unavailable
+    // over plain HTTP or without a user gesture).
+    const summary = snapshotSummary(result);
+    const summaryBox = document.createElement("div");
+    summaryBox.className = "snapshot-summary";
+    const summaryActions = text("div", "", "snapshot-summary-actions");
+    const copyButton = document.createElement("button");
+    copyButton.type = "button";
+    copyButton.className = "admin-button ghost snapshot-copy";
+    copyButton.textContent = "复制摘要";
+    const copyStatus = text("span", "", "snapshot-copy-status muted");
+    copyButton.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(summary);
+        copyStatus.textContent = "已复制到剪贴板。";
+        copyStatus.className = "snapshot-copy-status ok";
+      } catch {
+        copyStatus.textContent = "剪贴板不可用：请在下方文本框中手动全选复制。";
+        copyStatus.className = "snapshot-copy-status error";
+        summaryTextarea.hidden = false;
+      }
+    });
+    summaryActions.append(copyButton, copyStatus);
+    const summaryTextarea = document.createElement("textarea");
+    summaryTextarea.className = "snapshot-summary-text";
+    summaryTextarea.value = summary;
+    summaryTextarea.rows = summary.split("\n").length;
+    summaryTextarea.readOnly = true;
+    summaryTextarea.hidden = true;
+    const fallbackHint = document.createElement("button");
+    fallbackHint.type = "button";
+    fallbackHint.className = "admin-button ghost snapshot-show-text";
+    fallbackHint.textContent = "显示可全选文本";
+    fallbackHint.addEventListener("click", () => { summaryTextarea.hidden = false; summaryTextarea.focus(); summaryTextarea.select(); fallbackHint.hidden = true; });
+    summaryBox.append(summaryActions, fallbackHint, summaryTextarea);
+    wrapper.append(text("p", "下列摘要由关闭事务内写入的不可变快照生成，刷新、归档与服务重启后保持一致。", "muted snapshot-note"), summaryBox);
+  }
   return wrapper;
 }
 
@@ -310,6 +400,111 @@ function voteSection(poll: PollDetail): HTMLElement {
   return section;
 }
 
+// ---- Public receipt verification -------------------------------------------
+
+interface VerifyForm { id: string; pollId: string; optionId: string; nullifier: string }
+
+/**
+ * Receipt verification against POST /api/receipts/:id/verify. The form only
+ * handles the receipt's own public fields — an identity secret is never
+ * requested, and values live solely in the DOM (page memory). The request is
+ * sent without the admin token even when management mode is on.
+ */
+function receiptVerifySection(poll: PollDetail): HTMLElement {
+  const section = text("section", "", "receipt-verify");
+  section.append(text("h3", "回执核验"));
+  section.append(text("p", "凭投票回执上的编号与公开字段调用 POST /api/receipts/:id/verify 即可核验选票已被计入。核验不涉及也不索取身份秘密；输入仅保存在本页内存中，刷新即清空。", "muted verify-note"));
+
+  const fieldDefs: [keyof VerifyForm, string, string][] = [
+    ["id", "回执编号", "回执 UUID"],
+    ["pollId", "议题 id", poll.id],
+    ["optionId", "选项 id", "例如 weekday-evenings"],
+    ["nullifier", "Nullifier", "证明的公开输出"]
+  ];
+  const inputs = {} as Record<keyof VerifyForm, HTMLInputElement>;
+  const form = document.createElement("div");
+  form.className = "verify-form";
+  for (const [key, labelText, placeholder] of fieldDefs) {
+    const label = text("label", labelText, "verify-label");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.placeholder = placeholder;
+    input.dataset.field = key;
+    // Convenience default: the receipt being checked usually belongs to this poll.
+    if (key === "pollId") input.value = poll.id;
+    label.append(input);
+    form.append(label);
+    inputs[key] = input;
+  }
+
+  const submit = document.createElement("button");
+  submit.type = "button";
+  submit.className = "vote-submit verify-submit";
+  submit.textContent = "提交核验";
+  const statusLine = text("p", "", "verify-status muted");
+  statusLine.setAttribute("aria-live", "polite");
+  const resultBox = text("div", "", "verify-result");
+
+  let busy = false;
+  async function verify() {
+    if (busy) return;
+    const values: VerifyForm = { id: inputs.id.value.trim(), pollId: inputs.pollId.value.trim(), optionId: inputs.optionId.value.trim(), nullifier: inputs.nullifier.value.trim() };
+    if (!values.id || !values.pollId || !values.optionId || !values.nullifier) {
+      statusLine.textContent = "提交格式有误（400）：回执编号、pollId、optionId、nullifier 均须为非空文本。";
+      statusLine.className = "verify-status error";
+      return;
+    }
+    busy = true;
+    submit.disabled = true;
+    submit.textContent = "核验中…";
+    for (const input of Object.values(inputs)) input.disabled = true;
+    resultBox.replaceChildren();
+    try {
+      const data = await request<{ valid: true; receipt: VoteReceipt }>(`/api/receipts/${encodeURIComponent(values.id)}/verify`, {
+        method: "POST",
+        admin: false,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pollId: values.pollId, optionId: values.optionId, nullifier: values.nullifier })
+      });
+      statusLine.textContent = "核验成功（200）：回执存在，且 pollId、optionId、nullifier 全部一致。";
+      statusLine.className = "verify-status ok";
+      const receiptList = document.createElement("dl");
+      for (const [label, value] of [["回执编号", data.receipt.id], ["议题", data.receipt.pollId], ["选项", data.receipt.optionId], ["Nullifier", data.receipt.nullifier], ["接受时间", data.receipt.acceptedAt]]) {
+        receiptList.append(text("dt", label), text("dd", value));
+      }
+      resultBox.replaceChildren(receiptList);
+    } catch (error) {
+      const status = (error as { status?: number }).status;
+      const code = (error as { body?: { error?: string } })?.body?.error;
+      let message: string;
+      if (isNetworkFailure(error)) {
+        message = "网络失败：无法连接核验服务，请检查网络后修改重试。";
+      } else if (status === 404 || code === "receipt_not_found") {
+        message = "未知回执（404）：该回执编号不存在，请核对后重试。";
+      } else if (status === 422 || code === "receipt_mismatch") {
+        message = "回执字段不符（422 receipt_mismatch）：回执存在，但 pollId、optionId、nullifier 中至少一项不一致，可修改后重试。";
+      } else if (status === 400 || code === "invalid_verification" || code === "invalid_json") {
+        message = "提交格式有误（400）：四项字段均须为文本字符串。";
+      } else {
+        message = `${errorText(error)} 可修改后重试。`;
+      }
+      statusLine.textContent = message;
+      statusLine.className = "verify-status error";
+    } finally {
+      busy = false;
+      submit.disabled = false;
+      submit.textContent = "提交核验";
+      for (const input of Object.values(inputs)) input.disabled = false;
+    }
+  }
+  submit.addEventListener("click", () => void verify());
+  for (const input of Object.values(inputs)) input.addEventListener("keydown", event => { if (event.key === "Enter") void verify(); });
+
+  section.append(form, submit, statusLine, resultBox);
+  return section;
+}
+
 let selected = "";
 async function showPoll(id: string) {
   selected = id;
@@ -341,6 +536,7 @@ async function showPoll(id: string) {
       detail.append(text("p", "该议题仍为草稿：不对公众显示，普通详情、投票与结果均不可见。管理员可在上方完善成员名单后开放投票。", "draft-note"));
     } else if (poll.status === "open") {
       detail.append(voteSection(poll));
+      detail.append(receiptVerifySection(poll));
     } else {
       const mount = text("div", "", "results-mount");
       detail.append(text("p", poll.status === "closed" ? "议题已截止，结果如下并继续公开。" : "议题已归档，结果继续公开可查。", "muted"), mount);
@@ -350,6 +546,7 @@ async function showPoll(id: string) {
       } catch (error) {
         mount.replaceChildren(text("p", errorText(error), "error"));
       }
+      detail.append(receiptVerifySection(poll));
     }
   } catch (error) { if (selected === id) detail.replaceChildren(text("p", error instanceof Error ? error.message : "暂时无法读取议题", "error")); }
 }
@@ -468,36 +665,175 @@ function createDraftModal() {
   openModal("创建草稿议题（POST /api/polls）", body);
 }
 
-async function auditModal() {
+interface AuditFilters { pollId: string; action: string; result: string; from: string; to: string; pageSize: number }
+
+const AUDIT_ACTIONS = ["poll_create", "poll_status_change", "group_change", "group_change_rejected", "status_change_rejected"];
+
+function auditModal() {
   const body = document.createElement("div");
   body.className = "audit-body";
-  body.append(text("p", "正在读取审计记录…", "muted"));
   openModal("审计记录（GET /api/admin/audit，按时间倒序）", body);
-  try {
-    const { events } = await request<{ events: AuditEvent[] }>("/api/admin/audit");
-    body.replaceChildren();
-    if (events.length === 0) { body.append(text("p", "暂无审计事件。")); return; }
-    body.append(text("p", `共 ${events.length} 条；仅记录动作、议题、结果、时间与详情，不记录令牌、秘密或证明。`, "muted"));
-    const table = document.createElement("table");
-    table.className = "audit-table";
-    table.append(htmlRow("thead", ["时间", "动作", "议题", "结果", "详情"]));
-    const tbody = document.createElement("tbody");
-    for (const event of events) {
-      const tr = document.createElement("tr");
-      tr.append(htmlCell("td", dateTime(event.at)));
-      tr.append(htmlCell("td", ACTION_LABEL[event.action] ?? event.action));
-      tr.append(htmlCell("td", event.pollId, "mono"));
-      const resultCell = htmlCell("td", event.result === "success" ? "成功" : "失败");
-      resultCell.className = event.result === "success" ? "ok mono" : "error mono";
-      tr.append(resultCell);
-      tr.append(htmlCell("td", JSON.stringify(event.details), "mono details"));
-      tbody.append(tr);
-    }
-    table.append(tbody);
-    body.append(table);
-  } catch (error) {
-    body.replaceChildren(text("p", errorText(error), "error"));
+
+  const filters: AuditFilters = { pollId: "", action: "", result: "", from: "", to: "", pageSize: 10 };
+  let page = 1;
+  let totalPages = 1;
+  let requestSeq = 0;
+
+  const filterBar = document.createElement("div");
+  filterBar.className = "audit-filters";
+  function textFilter(key: "pollId" | "from" | "to", label: string, placeholder: string): HTMLInputElement {
+    const wrap = text("label", label, "audit-filter");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.placeholder = placeholder;
+    input.dataset.filter = key;
+    wrap.append(input);
+    filterBar.append(wrap);
+    return input;
   }
+  function selectFilter(key: "action" | "result" | "pageSize", label: string, options: [string, string][]): HTMLSelectElement {
+    const wrap = text("label", label, "audit-filter");
+    const select = document.createElement("select");
+    for (const [value, optionLabel] of options) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = optionLabel;
+      select.append(option);
+    }
+    select.dataset.filter = key;
+    wrap.append(select);
+    filterBar.append(wrap);
+    return select;
+  }
+  const pollIdInput = textFilter("pollId", "议题 id", "精确匹配，如 demo-tea-corner");
+  const fromInput = textFilter("from", "起始 from", "2026-09-20T10:00:00Z");
+  const toInput = textFilter("to", "截止 to", "带时区的严格 ISO8601");
+  const actionSelect = selectFilter("action", "动作", [["", "全部动作"], ...AUDIT_ACTIONS.map(action => [action, ACTION_LABEL[action] ?? action] as [string, string])]);
+  const resultSelect = selectFilter("result", "结果", [["", "全部结果"], ["success", "成功"], ["failure", "失败"]]);
+  const pageSizeSelect = selectFilter("pageSize", "每页", [["10", "10 条"], ["20", "20 条"], ["50", "50 条"], ["100", "100 条"], ["200", "200 条（上限）"]]);
+
+  const searchButton = document.createElement("button");
+  searchButton.type = "button";
+  searchButton.className = "admin-button primary audit-search";
+  searchButton.textContent = "查询";
+  filterBar.append(searchButton);
+  body.append(filterBar);
+
+  const content = text("div", "", "audit-content");
+  const pager = document.createElement("div");
+  pager.className = "audit-pager";
+  body.append(content, pager);
+
+  function buildQuery(): string {
+    const params = new URLSearchParams();
+    page = Math.max(1, Math.floor(page));
+    params.set("page", String(page));
+    params.set("pageSize", String(filters.pageSize));
+    for (const key of ["pollId", "action", "result", "from", "to"] as const) {
+      const value = filters[key].trim();
+      if (value) params.set(key, value);
+    }
+    return params.toString();
+  }
+
+  function pageButton(label: string, className: string): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `admin-button ghost ${className}`;
+    button.textContent = label;
+    pager.append(button);
+    return button;
+  }
+  const firstButton = pageButton("« 首页", "audit-first");
+  const prevButton = pageButton("‹ 上一页", "audit-prev");
+  const pageInfo = text("span", "", "audit-page-info");
+  const nextButton = pageButton("下一页 ›", "audit-next");
+  const lastButton = pageButton("末页 »", "audit-last");
+  pager.append(firstButton, prevButton, pageInfo, nextButton, lastButton);
+
+  async function load() {
+    const seq = ++requestSeq;
+    content.replaceChildren(text("p", "正在读取审计记录…", "muted audit-loading"));
+    pager.hidden = true;
+    try {
+      const data = await request<{ events: AuditEvent[]; total: number; page: number; pageSize: number; totalPages: number }>(`/api/admin/audit?${buildQuery()}`);
+      // A newer filter/paging request supersedes a stale in-flight response.
+      if (seq !== requestSeq) return;
+      content.replaceChildren();
+      totalPages = Math.max(1, data.totalPages);
+      pageInfo.textContent = `共 ${data.total} 条 · 第 ${data.page} / ${totalPages} 页（每页 ${data.pageSize} 条）`;
+      pager.hidden = false;
+      firstButton.disabled = data.page <= 1;
+      prevButton.disabled = data.page <= 1;
+      // An out-of-range page simply renders empty: next/last stay enabled via
+      // totalPages so the user can navigate back without anything crashing.
+      nextButton.disabled = data.page >= totalPages;
+      lastButton.disabled = data.page >= totalPages;
+      if (data.events.length === 0) {
+        content.append(text("p", data.total === 0 ? "暂无符合筛选条件的审计事件。" : "本页没有记录（页码可能超出范围）。", "audit-empty muted"));
+        return;
+      }
+      content.append(text("p", "仅记录动作、议题、结果、时间与详情，不记录令牌、身份秘密、承诺内容或零知识证明。", "muted"));
+      const table = document.createElement("table");
+      table.className = "audit-table";
+      table.append(htmlRow("thead", ["时间", "动作", "议题", "结果", "详情"]));
+      const tbody = document.createElement("tbody");
+      for (const event of data.events) {
+        const tr = document.createElement("tr");
+        tr.append(htmlCell("td", dateTime(event.at)));
+        tr.append(htmlCell("td", ACTION_LABEL[event.action] ?? event.action));
+        tr.append(htmlCell("td", event.pollId, "mono"));
+        const resultCell = htmlCell("td", event.result === "success" ? "成功" : "失败");
+        resultCell.className = event.result === "success" ? "ok mono" : "error mono";
+        tr.append(resultCell);
+        tr.append(htmlCell("td", JSON.stringify(event.details), "mono details"));
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      content.append(table);
+    } catch (error) {
+      if (seq !== requestSeq) return;
+      pager.hidden = true;
+      const status = (error as { status?: number }).status;
+      const code = (error as { body?: { error?: string } })?.body?.error;
+      let message: string;
+      if (isNetworkFailure(error)) message = "网络失败：暂时无法连接服务，请稍后重试。";
+      else if (status === 401 || code === "admin_unauthorized") message = "未授权（401 admin_unauthorized）：管理令牌缺失、错误或服务端未配置；请重新设置令牌后再打开审计视图。";
+      else if (status === 400 && code === "invalid_time_range") message = "时间参数无效（400）：from/to 必须是带时区的严格 ISO8601 时刻（如 2026-09-20T10:00:00Z），且区间不可倒置。";
+      else if (status === 400 && code === "invalid_pagination") message = "分页参数无效（400）：page 与 pageSize 须为正整数，pageSize 上限 200。";
+      else message = errorText(error);
+      content.replaceChildren(text("p", message, "error audit-error"));
+    }
+  }
+
+  function applyFilters() {
+    filters.pollId = pollIdInput.value;
+    filters.action = actionSelect.value;
+    filters.result = resultSelect.value;
+    filters.from = fromInput.value;
+    filters.to = toInput.value;
+    filters.pageSize = Number(pageSizeSelect.value);
+    // Any filter change restarts pagination at the first page.
+    page = 1;
+    void load();
+  }
+  searchButton.addEventListener("click", applyFilters);
+  for (const input of [pollIdInput, fromInput, toInput]) {
+    input.addEventListener("keydown", event => { if (event.key === "Enter") applyFilters(); });
+  }
+  actionSelect.addEventListener("change", applyFilters);
+  resultSelect.addEventListener("change", applyFilters);
+  pageSizeSelect.addEventListener("change", applyFilters);
+  firstButton.addEventListener("click", () => { page = 1; void load(); });
+  prevButton.addEventListener("click", () => { page -= 1; void load(); });
+  nextButton.addEventListener("click", () => { page += 1; void load(); });
+  lastButton.addEventListener("click", () => {
+    page = totalPages;
+    void load();
+  });
+
+  void load();
 }
 function htmlRow(part: "thead", cells: string[]): HTMLElement {
   const thead = document.createElement(part);
@@ -528,18 +864,24 @@ setButton.addEventListener("click", () => {
   adminToken = tokenInput.value.trim();
   tokenInput.value = "";
   applyAdminMode();
-  void loadPolls().then(polls => { if (polls[0]) void showPoll(polls[0].id); else detail.replaceChildren(text("div", "", "empty")); });
+  void loadPolls()
+    .then(polls => { if (polls[0]) void showPoll(polls[0].id); else detail.replaceChildren(text("div", "", "empty")); })
+    .catch(error => list.replaceChildren(text("p", error instanceof Error ? error.message : "目录暂时不可用", "error")));
 });
 clearButton.addEventListener("click", () => {
   adminToken = "";
   applyAdminMode();
-  void loadPolls().then(polls => { if (polls[0]) void showPoll(polls[0].id); });
+  void loadPolls()
+    .then(polls => { if (polls[0]) void showPoll(polls[0].id); })
+    .catch(error => list.replaceChildren(text("p", error instanceof Error ? error.message : "目录暂时不可用", "error")));
 });
 createButton.addEventListener("click", () => createDraftModal());
 auditButton.addEventListener("click", () => void auditModal());
 applyAdminMode();
 
-try {
-  const polls = await loadPolls();
-  if (polls[0]) await showPoll(polls[0].id); else list.append(text("p", "暂无议题"));
-} catch (error) { list.replaceChildren(text("p", error instanceof Error ? error.message : "目录暂时不可用", "error")); }
+void (async () => {
+  try {
+    const polls = await loadPolls();
+    if (polls[0]) await showPoll(polls[0].id); else list.append(text("p", "暂无议题"));
+  } catch (error) { list.replaceChildren(text("p", error instanceof Error ? error.message : "目录暂时不可用", "error")); }
+})();

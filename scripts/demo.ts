@@ -7,7 +7,7 @@ import { Group } from "@semaphore-protocol/group";
 import { generateProof } from "@semaphore-protocol/proof";
 import { createApp } from "../src/app.ts";
 import { terminateProverWorkers } from "../src/voting.ts";
-import type { AuditEvent, PollDetail, PollResults, PollSummary, SemaphoreProofPayload, VoteReceipt } from "../src/types.ts";
+import type { AuditEvent, AuditPage, PollDetail, PollResults, PollSummary, SemaphoreProofPayload, VoteReceipt } from "../src/types.ts";
 
 const ADMIN_TOKEN = "demo-admin-token";
 const directory = mkdtempSync(join(tmpdir(), "veilvote-demo-"));
@@ -41,6 +41,24 @@ function showResults(result: PollResults, poll: PollDetail) {
   const labels = new Map(poll.options.map(option => [option.id, option.label]));
   console.log(`结果（共 ${result.total} 票）：`);
   for (const option of result.options) console.log(`  ${labels.get(option.id) ?? option.id}：${option.count} 票`);
+}
+/** Canonical, copyable snapshot summary in the same field order as the digest input. */
+function snapshotText(result: PollResults): string {
+  const snapshot = result.snapshot!;
+  return [
+    `pollId: ${snapshot.pollId}`,
+    `groupVersion: ${snapshot.groupVersion}`,
+    `total: ${snapshot.total}`,
+    ...snapshot.options.map(option => `options.${option.id}: ${option.count}`),
+    `closedAt: ${snapshot.closedAt}`,
+    `digest: ${snapshot.digest}`
+  ].join("\n");
+}
+async function verifyReceipt(base: string, id: string, body: unknown) {
+  const response = await fetch(`${base}/api/receipts/${encodeURIComponent(id)}/verify`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  });
+  return { status: response.status, body: await response.json().catch(() => ({})) as Record<string, unknown> };
 }
 const commitmentOf = (secret: string) => new Identity(secret).commitment.toString();
 
@@ -122,21 +140,55 @@ try {
   const afterDeadline = await pollDetail(base, deadlineId, ADMIN_TOKEN);
   console.log(`   截止后议题状态已原子持久化为：${afterDeadline.status}`);
 
-  console.log("\n8) open → closed → archived，closed/archived 结果继续公开…");
+  console.log("\n8) open → closed → archived，closed/archived 结果继续公开，快照字段完整可复制…");
   const closed = await api(base, `/api/polls/${draftId}/status`, { method: "POST", body: JSON.stringify({ status: "closed", expectedStatus: "open" }) });
   console.log(`   open → closed：${closed.status}`);
-  showResults((await (await fetch(`${base}/api/polls/${draftId}/results`)).json() as { result: PollResults }).result, poll);
+  const closedResult = (await (await fetch(`${base}/api/polls/${draftId}/results`)).json() as { result: PollResults }).result;
+  showResults(closedResult, poll);
+  const closedSnapshot = closedResult.snapshot!;
+  console.log("   不可变快照（与计票同事务写入，字段顺序即摘要可复制顺序）：");
+  console.log(snapshotText(closedResult).split("\n").map(line => `     ${line}`).join("\n"));
   const archived = await api(base, `/api/polls/${draftId}/status`, { method: "POST", body: JSON.stringify({ status: "archived", expectedStatus: "closed" }) });
   console.log(`   closed → archived：${archived.status}；归档后结果 → ${(await fetch(`${base}/api/polls/${draftId}/results`)).status}`);
+  const archivedSnapshot = ((await (await fetch(`${base}/api/polls/${draftId}/results`)).json() as { result: PollResults }).result).snapshot!;
+  console.log(`   归档后快照 digest 与关闭时一致：${archivedSnapshot.digest === closedSnapshot.digest}`);
 
-  console.log("\n9) 审计查询（GET /api/admin/audit，倒序）…");
+  console.log("\n8a) 回执核验 POST /api/receipts/:id/verify（公开接口，不涉及身份秘密）…");
+  console.log(`   字段全部相符 → ${(await verifyReceipt(base, vote.body.receipt!.id, { pollId: draftId, optionId: poll.options[0].id, nullifier: vote.body.receipt!.nullifier })).status}`);
+  console.log(`   nullifier 不符 → ${(await verifyReceipt(base, vote.body.receipt!.id, { pollId: draftId, optionId: poll.options[0].id, nullifier: "bogus" })).status} receipt_mismatch`);
+  console.log(`   未知回执编号 → ${(await verifyReceipt(base, "no-such-receipt", { pollId: draftId, optionId: poll.options[0].id, nullifier: "x" })).status} receipt_not_found`);
+  console.log(`   缺字段（格式错误）→ ${(await verifyReceipt(base, vote.body.receipt!.id, { pollId: draftId })).status} invalid_verification`);
+
+  console.log("\n9) 审计查询（GET /api/admin/audit，倒序、筛选、分页、严格时间校验）…");
   const audit = await api(base, "/api/admin/audit", { method: "GET" });
-  const events = audit.body.events as AuditEvent[];
-  console.log(`   共 ${events.length} 条事件，最近 8 条：`);
-  for (const event of events.slice(0, 8)) {
+  const auditPage = audit.body as unknown as AuditPage;
+  const events = auditPage.events;
+  console.log(`   共 ${auditPage.total} 条事件，第 ${auditPage.page}/${auditPage.totalPages} 页（默认每页 ${auditPage.pageSize} 条），最近 5 条：`);
+  for (const event of events.slice(0, 5)) {
     console.log(`   [${event.at}] ${event.action} / ${event.pollId} / ${event.result} / ${JSON.stringify(event.details)}`);
   }
-  console.log(`   审计中是否泄露令牌？${JSON.stringify(events).includes(ADMIN_TOKEN)}（应为 false）`);
+  console.log(`   审计中是否泄露令牌？${JSON.stringify(audit.body).includes(ADMIN_TOKEN)}（应为 false）`);
+
+  // Filters: exact-match pollId/action/result compose; filters and pagination
+  // travel together on one query string.
+  const onlyDraft = await api(base, `/api/admin/audit?pollId=${encodeURIComponent(draftId)}&action=poll_status_change&pageSize=5`, { method: "GET" });
+  const draftEvents = (onlyDraft.body as unknown as AuditPage).events;
+  console.log(`   筛选 pollId=${draftId}&action=poll_status_change：${onlyDraft.body.total} 条，全部匹配：${draftEvents.every(e => e.pollId === draftId && e.action === "poll_status_change")}`);
+
+  // Pagination contract: capped page size, out-of-range page is an empty 200.
+  const capped = await api(base, "/api/admin/audit?pageSize=999", { method: "GET" });
+  console.log(`   pageSize=999 被截断为 ${capped.body.pageSize}（上限 200）；page=999 返回空页：${((await api(base, "/api/admin/audit?page=999", { method: "GET" })).body.events as AuditEvent[]).length === 0}`);
+
+  // from/to accept only strict timezone-aware ISO 8601 instants.
+  const pivot = events[events.length - 1]?.at ?? new Date().toISOString();
+  const range = await api(base, `/api/admin/audit?from=${encodeURIComponent(pivot)}&to=${encodeURIComponent(pivot)}`, { method: "GET" });
+  console.log(`   含端点区间 from=to=${pivot}：${range.status}，命中 ${((range.body.events as AuditEvent[]).filter(e => e.at === pivot).length >= 1) ? "是" : "否"}`);
+  for (const loose of ["2026-09-20", "2026-09-20 10:00:00Z", "2026-09-20T10:00:00", "2026-02-29T00:00:00Z"]) {
+    const rejected = await api(base, `/api/admin/audit?from=${encodeURIComponent(loose)}`, { method: "GET" });
+    console.log(`   宽松时间「${loose}」→ ${rejected.status} ${rejected.body.error}`);
+  }
+  const invertedAudit = await api(base, "/api/admin/audit?from=2026-12-31T00:00:00Z&to=2026-01-01T00:00:00Z", { method: "GET" });
+  console.log(`   倒置区间 → ${invertedAudit.status} ${invertedAudit.body.error}`);
 
   await stop(server);
   console.log("\n10) 服务已停止，使用同一 SQLite 文件重启，验证恢复…");
@@ -151,10 +203,13 @@ try {
     console.log(`   重启后审计事件数：${restartedEvents.length}（与重启前一致：${restartedEvents.length === events.length}）`);
     const recoveredResult = await (await fetch(`${restarted.base}/api/polls/${draftId}/results`)).json() as { result: PollResults };
     showResults(recoveredResult.result, recovered);
+    const restartedDigest = recoveredResult.result.snapshot!.digest;
+    console.log(`   重启后快照 closedAt=${recoveredResult.result.snapshot!.closedAt}、groupVersion=v${recoveredResult.result.snapshot!.groupVersion}`);
+    console.log(`   重启后 digest 与关闭时完全一致：${restartedDigest === archivedSnapshot.digest}（${restartedDigest.slice(0, 16)}…）`);
   } finally {
     await stop(restarted.server);
   }
-  console.log("\n演示完成：管理授权、draft 生命周期、非法转换拒绝、首票冻结、截止并发裁决与重启恢复、审计留痕均已验证。");
+  console.log("\n演示完成：管理授权、draft 生命周期、非法转换拒绝、首票冻结、截止并发裁决、closed/archived 快照（含可复制摘要与 digest）、回执核验四种结果、审计严格时间校验/筛选/翻页与重启恢复均已验证。");
 } finally {
   await terminateProverWorkers();
   rmSync(directory, { recursive: true, force: true });

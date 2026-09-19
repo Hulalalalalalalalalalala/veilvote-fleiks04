@@ -5,6 +5,7 @@ import { timingSafeEqual } from "node:crypto";
 import { verifyProof, type SemaphoreProof } from "@semaphore-protocol/proof";
 import { openCatalog, STATUSES, type AuditQuery, type GroupOperation, type NewPollInput } from "./store.ts";
 import { isCommitment, isProofPayload, terminateProverWorkers, textToField } from "./voting.ts";
+import { parseInstant } from "./time.ts";
 import type { AuditEvent, PollStatus } from "./types.ts";
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -30,9 +31,6 @@ function readBody(request: IncomingMessage): Promise<string> {
 
 function isNonEmptyString(value: unknown, maxLength = 2000): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;
-}
-function isIsoDate(value: unknown): value is string {
-  return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
 export function createApp(databasePath: string, publicPath = resolve("dist/public"), options: AppOptions = {}) {
@@ -309,21 +307,25 @@ type ParseAuditQueryResult =
   | { ok: false; error: string };
 
 /**
- * Validates the audit trail filters. from/to must be ISO8601 instants and are
- * inclusive at both ends; an unparseable value or an inverted range is a 400.
- * pageSize defaults to 50 and is capped at 200.
+ * Validates the audit trail filters. from/to must be strict timezone-aware
+ * ISO 8601 instants (values only `Date.parse` tolerates loosely — date-only,
+ * space-separated, zone-less, impossible calendar dates — are rejected) and
+ * are inclusive at both ends; an inverted range is a 400. pageSize defaults
+ * to 50 and is capped at 200.
  */
 function parseAuditQuery(params: URLSearchParams): ParseAuditQueryResult {
   const query: AuditQuery = { page: 1, pageSize: DEFAULT_AUDIT_PAGE_SIZE };
   const from = params.get("from");
   const to = params.get("to");
   if (from !== null) {
-    if (!isIsoDate(from)) return { ok: false, error: "invalid_time_range" };
-    query.from = new Date(Date.parse(from)).toISOString();
+    const parsed = parseInstant(from);
+    if (!parsed) return { ok: false, error: "invalid_time_range" };
+    query.from = parsed;
   }
   if (to !== null) {
-    if (!isIsoDate(to)) return { ok: false, error: "invalid_time_range" };
-    query.to = new Date(Date.parse(to)).toISOString();
+    const parsed = parseInstant(to);
+    if (!parsed) return { ok: false, error: "invalid_time_range" };
+    query.to = parsed;
   }
   if (query.from !== undefined && query.to !== undefined && query.from > query.to) {
     return { ok: false, error: "invalid_time_range" };
@@ -368,8 +370,10 @@ function parseNewPoll(body: unknown): ParsePollResult {
   if (!isNonEmptyString(b.summary)) return fail("invalid_poll");
   if (!isNonEmptyString(b.description, 20_000)) return fail("invalid_poll");
   if (!isNonEmptyString(b.organizer)) return fail("invalid_poll");
-  if (!isIsoDate(b.publishedAt) || !isIsoDate(b.closesAt)) return fail("invalid_poll_dates");
-  if (Date.parse(b.closesAt as string) <= Date.parse(b.publishedAt as string)) return fail("invalid_poll_dates");
+  const publishedAt = parseInstant(b.publishedAt);
+  const closesAt = parseInstant(b.closesAt);
+  if (!publishedAt || !closesAt) return fail("invalid_poll_dates");
+  if (closesAt <= publishedAt) return fail("invalid_poll_dates");
   if (!Array.isArray(b.options) || b.options.length < 2) return fail("invalid_options");
   const optionIds = new Set<string>();
   const options: { id: string; label: string }[] = [];
@@ -392,7 +396,7 @@ function parseNewPoll(body: unknown): ParsePollResult {
     ok: true,
     input: {
       id: b.id, title: b.title, summary: b.summary, description: b.description, organizer: b.organizer,
-      publishedAt: new Date(b.publishedAt).toISOString(), closesAt: new Date(b.closesAt).toISOString(),
+      publishedAt, closesAt,
       options, commitments
     }
   };
