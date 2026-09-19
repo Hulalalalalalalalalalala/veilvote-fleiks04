@@ -16,8 +16,11 @@ import type { GroupVersionSummary, PollDetail, SemaphoreProofPayload, VoteReceip
 // Release the snarkjs worker pool so the test process can exit.
 test.after(() => terminateProverWorkers());
 
+const ADMIN_TOKEN = "test-admin-token";
+const adminHeaders = { "Content-Type": "application/json", "X-Admin-Token": ADMIN_TOKEN };
+
 async function serve(databasePath: string): Promise<{ server: Server; base: string }> {
-  const server = createApp(databasePath);
+  const server = createApp(databasePath, undefined, { adminToken: ADMIN_TOKEN });
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
   const address = server.address();
   assert.ok(address && typeof address !== "string");
@@ -32,10 +35,12 @@ async function pollDetail(base: string, id: string): Promise<PollDetail> {
   assert.equal(response.status, 200);
   return ((await response.json()) as { poll: PollDetail }).poll;
 }
-async function postGroup(base: string, pollId: string, payload: unknown) {
+async function postGroup(base: string, pollId: string, payload: unknown, token?: string) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token !== "") headers["X-Admin-Token"] = token ?? ADMIN_TOKEN;
   const response = await fetch(`${base}/api/polls/${encodeURIComponent(pollId)}/group`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: typeof payload === "string" ? payload : JSON.stringify(payload)
   });
   return { status: response.status, body: await response.json() as { group?: GroupVersionSummary; error?: string } };

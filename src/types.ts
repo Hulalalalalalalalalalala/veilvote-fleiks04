@@ -1,10 +1,11 @@
+export type PollStatus = "draft" | "open" | "closed" | "archived";
 export interface PollOption { id: string; label: string }
 export interface PollSummary {
   id: string;
   title: string;
   summary: string;
   organizer: string;
-  status: "open";
+  status: PollStatus;
   publishedAt: string;
   closesAt: string;
   memberCount: number;
@@ -43,4 +44,21 @@ export interface PollResults {
   pollId: string;
   total: number;
   options: { id: string; count: number }[];
+}
+/** Administrative actions recorded in the audit trail. */
+export type AuditAction =
+  | "poll_create"
+  | "poll_status_change"
+  | "group_change"
+  | "group_change_rejected"
+  | "status_change_rejected";
+export interface AuditEvent {
+  id: string;
+  action: AuditAction;
+  pollId: string;
+  /** Whether the requested change was applied. */
+  result: "success" | "failure";
+  at: string;
+  /** Action-specific, non-sensitive context (never the token, secrets or proofs). */
+  details: Record<string, unknown>;
 }

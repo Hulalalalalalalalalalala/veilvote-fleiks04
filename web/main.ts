@@ -1,10 +1,38 @@
 import "./style.css";
-import type { PollDetail, PollResults, PollSummary, VoteReceipt } from "../src/types.ts";
+import type { AuditEvent, PollDetail, PollResults, PollStatus, PollSummary, VoteReceipt } from "../src/types.ts";
+
+// The management token lives only in page memory: never written to
+// localStorage/sessionStorage, never printed into the page or audit trail.
+let adminToken = "";
+
+const STATUS_LABEL: Record<PollStatus, string> = { draft: "草稿", open: "投票中", closed: "已截止", archived: "已归档" };
+// The single legal successor of each status (draft→open→closed→archived).
+const NEXT_STATUS: Record<PollStatus, PollStatus | null> = { draft: "open", open: "closed", closed: "archived", archived: null };
+const NEXT_ACTION_LABEL: Record<PollStatus, string> = {
+  draft: "开放议题 · 开始投票",
+  open: "结束投票 · 截止议题",
+  closed: "归档议题",
+  archived: "议题已归档"
+};
+const ACTION_LABEL: Record<string, string> = {
+  poll_create: "创建议题",
+  poll_status_change: "状态转换",
+  group_change: "成员变更",
+  group_change_rejected: "成员变更被拒",
+  status_change_rejected: "状态转换被拒"
+};
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
-app.innerHTML = `<header><a class="brand" href="/" aria-label="VeilVote 首页"><span class="mark">V</span>VeilVote</a><span class="header-note">社区议事 / 匿名投票</span></header><main><section class="intro"><p class="eyebrow">COMMUNITY COMMONS</p><h1>让每个声音，<br>都从知情开始。</h1><p>浏览社区正在讨论的议题，以 Semaphore 零知识证明匿名投出你的一票。</p><div class="intro-footer"><span class="status-dot"></span>议题目录<span class="intro-divider">/</span><span id="poll-count">正在读取…</span></div></section><section class="workspace" aria-label="议题浏览器"><aside><p class="section-caption">当前议题</p><div id="poll-list" aria-live="polite">加载中…</div></aside><article id="poll-detail" aria-live="polite"><div class="empty">选择议题查看内容</div></article></section></main><footer><span>VeilVote</span><span>公开信息 · 独立判断 · 社区共识</span></footer>`;
+app.innerHTML = `<header><a class="brand" href="/" aria-label="VeilVote 首页"><span class="mark">V</span>VeilVote</a><div class="header-admin"><span class="header-note">社区议事 / 匿名投票</span><div class="admin-token-row"><input id="admin-token" type="password" autocomplete="off" placeholder="管理员令牌 X-Admin-Token" /><button type="button" id="admin-set" class="admin-button">设置</button><button type="button" id="admin-clear" class="admin-button ghost" hidden>清除</button><button type="button" id="admin-create" class="admin-button ghost" hidden>新建议题</button><button type="button" id="admin-audit" class="admin-button ghost" hidden>审计记录</button><span id="admin-mode" class="admin-mode" hidden>管理模式</span></div></div></header><main><section class="intro"><p class="eyebrow">COMMUNITY COMMONS</p><h1>让每个声音，<br>都从知情开始。</h1><p>浏览社区正在讨论的议题，以 Semaphore 零知识证明匿名投出你的一票。议题经历草稿、开放、截止与归档四个阶段，管理操作全程留痕。</p><div class="intro-footer"><span class="status-dot"></span>议题目录<span class="intro-divider">/</span><span id="poll-count">正在读取…</span></div></section><section class="workspace" aria-label="议题浏览器"><aside><p class="section-caption">当前议题</p><div id="poll-list" aria-live="polite">加载中…</div></aside><article id="poll-detail" aria-live="polite"><div class="empty">选择议题查看内容</div></article></section></main><footer><span>VeilVote</span><span>公开信息 · 独立判断 · 社区共识</span></footer><div id="modal-root"></div>`;
 const list = document.querySelector<HTMLDivElement>("#poll-list")!;
 const detail = document.querySelector<HTMLElement>("#poll-detail")!;
+const tokenInput = document.querySelector<HTMLInputElement>("#admin-token")!;
+const setButton = document.querySelector<HTMLButtonElement>("#admin-set")!;
+const clearButton = document.querySelector<HTMLButtonElement>("#admin-clear")!;
+const createButton = document.querySelector<HTMLButtonElement>("#admin-create")!;
+const auditButton = document.querySelector<HTMLButtonElement>("#admin-audit")!;
+const adminMode = document.querySelector<HTMLSpanElement>("#admin-mode")!;
+const modalRoot = document.querySelector<HTMLDivElement>("#modal-root")!;
 
 function text(tag: string, content: string, className?: string): HTMLElement {
   const element = document.createElement(tag);
@@ -13,32 +41,57 @@ function text(tag: string, content: string, className?: string): HTMLElement {
   return element;
 }
 function date(value: string) { return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric", timeZone: "Asia/Shanghai" }).format(new Date(value)); }
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
-  if (!response.ok) throw Object.assign(new Error(`请求失败（${response.status}）`), { status: response.status, body: await response.json().catch(() => undefined) });
-  return response.json() as Promise<T>;
+function dateTime(value: string) { return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Shanghai" }).format(new Date(value)); }
+function isAdmin(): boolean { return adminToken.length > 0; }
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  // Attach the in-memory token to every request while management mode is on.
+  if (isAdmin()) headers.set("X-Admin-Token", adminToken);
+  const response = await fetch(path, { ...init, headers });
+  const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
+  if (!response.ok) throw Object.assign(new Error(`请求失败（${response.status}）`), { status: response.status, body });
+  return body as T;
 }
 
 const ERROR_TEXT: Record<string, string> = {
-  poll_closed: "议题已截止，无法投票",
+  admin_unauthorized: "管理令牌缺失、错误或服务端未配置（401，未执行任何写入）",
+  poll_closed: "议题未开放或已截止，无法投票",
   duplicate_nullifier: "该身份已在此议题投过票（重复提交被拒绝）",
   invalid_proof: "证明无效，投票被拒绝",
   proof_binding_mismatch: "证明与议题或选项不匹配，投票被拒绝",
-  group_version_changed: "成员名单已变更，请基于最新版本重新生成证明",
+  group_version_changed: "成员名单已变更或乐观版本过期，请刷新后重试",
   group_frozen: "议题已有选票，成员名单已冻结",
+  poll_not_editable: "当前状态下不可变更成员（仅草稿或未投票的开放议题可变更）",
   unknown_merkle_root: "证明对应的成员版本不存在",
   unknown_option: "选项无效",
   invalid_vote: "提交内容格式不正确",
-  poll_not_found: "议题不存在"
+  poll_not_found: "议题不存在",
+  illegal_transition: "非法状态转换（仅允许 草稿→开放→截止→归档）",
+  status_conflict: "状态已变化，expectedStatus 与当前状态冲突",
+  invalid_status: "状态值非法",
+  poll_exists: "议题 id 已存在",
+  invalid_poll: "议题字段不合法（标题、摘要、描述、组织方均不可为空）",
+  invalid_poll_id: "议题 id 不合法或为空",
+  invalid_poll_dates: "时间不合法，截止时间必须晚于发布时间",
+  invalid_options: "至少需要两个选项，且 id 非空、标签非空",
+  duplicate_option_id: "选项 id 重复",
+  invalid_commitments: "成员承诺必须为非空的合法字段元素",
+  duplicate_commitment: "成员承诺重复",
+  invalid_group_operation: "成员变更内容格式不正确"
 };
 function errorText(error: unknown): string {
   const code = (error as { body?: { error?: string } })?.body?.error;
   return (code && ERROR_TEXT[code]) || (error instanceof Error ? error.message : "操作失败，请重试");
 }
 
+function statusBadge(status: PollStatus): HTMLElement {
+  return text("span", STATUS_LABEL[status], `status-badge status-${status}`);
+}
+
 function resultsBlock(result: PollResults, poll: PollDetail): HTMLElement {
   const wrapper = text("div", "", "results");
-  wrapper.append(text("h3", `当前结果 · 共 ${result.total} 票`));
+  wrapper.append(text("h3", poll.status === "open" ? `当前结果 · 共 ${result.total} 票` : `最终结果 · 共 ${result.total} 票`));
   const labels = new Map(poll.options.map(option => [option.id, option.label]));
   const listElement = document.createElement("ul");
   for (const option of result.options) {
@@ -49,6 +102,107 @@ function resultsBlock(result: PollResults, poll: PollDetail): HTMLElement {
   wrapper.append(listElement);
   return wrapper;
 }
+
+// ---- Management: lifecycle transition --------------------------------------
+
+function adminSection(poll: PollDetail): HTMLElement {
+  const section = text("section", "", "admin-panel");
+  section.append(text("h3", "议题管理"));
+  const next = NEXT_STATUS[poll.status];
+  const transition = document.createElement("button");
+  transition.type = "button";
+  transition.className = "admin-button primary";
+  transition.textContent = NEXT_ACTION_LABEL[poll.status];
+  transition.disabled = next === null;
+  const note = text("p", "", "muted admin-note");
+  note.textContent = next
+    ? `合法转换：${STATUS_LABEL[poll.status]} → ${STATUS_LABEL[next]}（提交 expectedStatus=${poll.status}）`
+    : "议题已归档，没有进一步的状态转换。";
+  const statusLine = text("p", "", "admin-status-line");
+  statusLine.setAttribute("aria-live", "polite");
+  transition.addEventListener("click", async () => {
+    if (!next) return;
+    transition.disabled = true;
+    statusLine.textContent = "正在提交状态转换…";
+    statusLine.className = "admin-status-line";
+    try {
+      await request(`/api/polls/${encodeURIComponent(poll.id)}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: next, expectedStatus: poll.status })
+      });
+      statusLine.textContent = `已转换为「${STATUS_LABEL[next]}」。`;
+      statusLine.className = "admin-status-line ok";
+      await loadPolls();
+      await showPoll(poll.id);
+    } catch (error) {
+      statusLine.textContent = errorText(error);
+      statusLine.className = "admin-status-line error";
+      transition.disabled = false;
+    }
+  });
+  section.append(transition, note, statusLine);
+  if (poll.status === "draft" || poll.status === "open") section.append(memberAdminSection(poll));
+  return section;
+}
+
+function memberAdminSection(poll: PollDetail): HTMLElement {
+  const box = document.createElement("details");
+  box.className = "member-admin";
+  box.append(text("summary", "成员名单管理（join / rotate / revoke）"));
+  box.append(text("p", `当前成员版本 v${poll.groupVersion} · ${poll.eligibleMemberCommitments.length} 个承诺。草稿或尚未投票的开放议题可变更；首票投出后即冻结。`, "muted"));
+
+  function row(operation: string, fields: [string, string][], label: string, build: (values: Record<string, string>) => Record<string, string>): HTMLElement {
+    const form = document.createElement("div");
+    form.className = "member-form";
+    const inputs: Record<string, HTMLInputElement> = {};
+    for (const [key, placeholder] of fields) {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = placeholder;
+      input.dataset.field = key;
+      inputs[key] = input;
+      form.append(input);
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "admin-button";
+    button.textContent = label;
+    const line = text("p", "", "member-form-status muted");
+    button.addEventListener("click", async () => {
+      const values = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value.trim()]));
+      if (Object.values(values).some(value => !value)) { line.textContent = "请填写全部字段。"; line.className = "member-form-status error"; return; }
+      button.disabled = true;
+      try {
+        const payload = { operation, expectedVersion: poll.groupVersion, ...build(values) };
+        const { group } = await request<{ group: { version: number } }>(`/api/polls/${encodeURIComponent(poll.id)}/group`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        line.textContent = `已生成新版本 v${group.version}。`;
+        line.className = "member-form-status ok";
+        await loadPolls();
+        await showPoll(poll.id);
+      } catch (error) {
+        line.textContent = errorText(error);
+        line.className = "member-form-status error";
+        button.disabled = false;
+      }
+    });
+    form.append(button, line);
+    return form;
+  }
+
+  box.append(
+    row("join", [["commitment", "新成员承诺（十进制）"]], "追加成员", v => ({ commitment: v.commitment })),
+    row("rotate", [["oldCommitment", "旧承诺"], ["newCommitment", "新承诺"]], "原位替换", v => ({ oldCommitment: v.oldCommitment, newCommitment: v.newCommitment })),
+    row("revoke", [["commitment", "待移除承诺"]], "移除成员", v => ({ commitment: v.commitment }))
+  );
+  return box;
+}
+
+// ---- Voting ----------------------------------------------------------------
 
 function voteSection(poll: PollDetail): HTMLElement {
   const section = text("section", "", "vote");
@@ -64,8 +218,7 @@ function voteSection(poll: PollDetail): HTMLElement {
 
   const optionFieldset = document.createElement("fieldset");
   optionFieldset.className = "vote-options";
-  const legend = text("legend", "选择方案");
-  optionFieldset.append(legend);
+  optionFieldset.append(text("legend", "选择方案"));
   poll.options.forEach((option, index) => {
     const label = document.createElement("label");
     const radio = document.createElement("input");
@@ -166,7 +319,7 @@ async function showPoll(id: string) {
     const { poll } = await request<{ poll: PollDetail }>(`/api/polls/${encodeURIComponent(id)}`);
     if (selected !== id) return;
     const heading = text("div", "", "detail-heading");
-    heading.append(text("span", "公开议题", "tag"), text("span", `发布于 ${date(poll.publishedAt)}`, "muted"));
+    heading.append(text("span", "公开议题", "tag"), statusBadge(poll.status), text("span", `发布于 ${date(poll.publishedAt)}`, "muted"));
     const stats = text("div", "", "stats");
     for (const [label, value] of [["参与成员", `${poll.memberCount} 位`], ["可选方案", `${poll.optionCount} 项`], ["成员版本", `v${poll.groupVersion}`], ["截止日期", date(poll.closesAt)]]) {
       const item = text("div", ""); item.append(text("span", label, "muted"), text("strong", value)); stats.append(item);
@@ -180,17 +333,213 @@ async function showPoll(id: string) {
     rootLine.append(text("span", "当前快照 Merkle 根："), text("code", poll.merkleRoot));
     commitments.append(rootLine);
     poll.eligibleMemberCommitments.forEach(commitment => commitments.append(text("code", commitment)));
-    detail.replaceChildren(heading, text("h2", poll.title), text("p", poll.description, "description"), text("p", `议题组织方 / ${poll.organizer}`, "organizer"), stats, text("h3", "议题方案"), options, commitments, voteSection(poll));
+
+    detail.replaceChildren();
+    detail.append(heading, text("h2", poll.title), text("p", poll.description, "description"), text("p", `议题组织方 / ${poll.organizer}`, "organizer"), stats, text("h3", "议题方案"), options, commitments);
+    if (isAdmin()) detail.append(adminSection(poll));
+    if (poll.status === "draft") {
+      detail.append(text("p", "该议题仍为草稿：不对公众显示，普通详情、投票与结果均不可见。管理员可在上方完善成员名单后开放投票。", "draft-note"));
+    } else if (poll.status === "open") {
+      detail.append(voteSection(poll));
+    } else {
+      const mount = text("div", "", "results-mount");
+      detail.append(text("p", poll.status === "closed" ? "议题已截止，结果如下并继续公开。" : "议题已归档，结果继续公开可查。", "muted"), mount);
+      try {
+        const { result } = await request<{ result: PollResults }>(`/api/polls/${encodeURIComponent(poll.id)}/results`);
+        mount.replaceChildren(resultsBlock(result, poll));
+      } catch (error) {
+        mount.replaceChildren(text("p", errorText(error), "error"));
+      }
+    }
   } catch (error) { if (selected === id) detail.replaceChildren(text("p", error instanceof Error ? error.message : "暂时无法读取议题", "error")); }
 }
-try {
+
+async function loadPolls() {
   const { polls } = await request<{ polls: PollSummary[] }>("/api/polls");
-  document.querySelector("#poll-count")!.textContent = `${polls.length} 个议题`;
+  document.querySelector("#poll-count")!.textContent = `${polls.length} 个议题${isAdmin() ? "（含草稿）" : ""}`;
   list.replaceChildren();
   polls.forEach(poll => {
     const button = document.createElement("button"); button.type = "button"; button.dataset.id = poll.id; button.className = "poll-card";
-    button.append(text("span", poll.organizer, "card-organizer"), text("strong", poll.title), text("span", poll.summary, "card-summary"), text("span", `${poll.memberCount} 位成员 · ${poll.optionCount} 个方案`, "card-meta"));
+    const top = document.createElement("span"); top.className = "card-top";
+    top.append(text("span", poll.organizer, "card-organizer"), statusBadge(poll.status));
+    button.append(top, text("strong", poll.title), text("span", poll.summary, "card-summary"), text("span", `${poll.memberCount} 位成员 · ${poll.optionCount} 个方案`, "card-meta"));
     button.addEventListener("click", () => void showPoll(poll.id)); list.append(button);
   });
+  return polls;
+}
+
+// ---- Modals: create draft + audit ------------------------------------------
+
+function openModal(title: string, body: HTMLElement) {
+  modalRoot.replaceChildren();
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const panel = document.createElement("div");
+  panel.className = "modal";
+  const heading = text("div", "", "modal-heading");
+  heading.append(text("h3", title));
+  const close = document.createElement("button");
+  close.type = "button"; close.className = "admin-button ghost"; close.textContent = "关闭";
+  close.addEventListener("click", () => modalRoot.replaceChildren());
+  overlay.addEventListener("click", event => { if (event.target === overlay) modalRoot.replaceChildren(); });
+  heading.append(close);
+  panel.append(heading, body);
+  overlay.append(panel);
+  modalRoot.append(overlay);
+}
+
+function toLocalInputValue(dateValue: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${dateValue.getFullYear()}-${pad(dateValue.getMonth() + 1)}-${pad(dateValue.getDate())}T${pad(dateValue.getHours())}`;
+}
+
+function createDraftModal() {
+  const body = document.createElement("div");
+  body.className = "create-form";
+  const field = (label: string, input: HTMLInputElement | HTMLTextAreaElement) => {
+    const wrapper = text("label", label, "create-label");
+    wrapper.append(input);
+    body.append(wrapper);
+    return input;
+  };
+  const idInput = field("议题 id（slug，唯一）", Object.assign(document.createElement("input"), { type: "text", placeholder: "例如 community-tea-house" })) as HTMLInputElement;
+  const titleInput = field("标题", Object.assign(document.createElement("input"), { type: "text" })) as HTMLInputElement;
+  const organizerInput = field("组织方", Object.assign(document.createElement("input"), { type: "text" })) as HTMLInputElement;
+  const summaryInput = field("摘要", Object.assign(document.createElement("input"), { type: "text" })) as HTMLInputElement;
+  const descriptionInput = field("详细描述", Object.assign(document.createElement("textarea"), { rows: 3 })) as HTMLTextAreaElement;
+  const publishedInput = field("发布时间", Object.assign(document.createElement("input"), { type: "datetime-local" })) as HTMLInputElement;
+  const closesInput = field("截止时间", Object.assign(document.createElement("input"), { type: "datetime-local" })) as HTMLInputElement;
+  publishedInput.value = toLocalInputValue(new Date());
+  const defaultClose = new Date(); defaultClose.setDate(defaultClose.getDate() + 14);
+  closesInput.value = toLocalInputValue(defaultClose);
+
+  body.append(text("p", "选项（至少两个，id 唯一）", "create-label"));
+  const optionsMount = document.createElement("div");
+  optionsMount.className = "option-rows";
+  const optionRows: { id: HTMLInputElement; label: HTMLInputElement }[] = [];
+  function addOptionRow(id = "", label = "") {
+    const rowDiv = document.createElement("div"); rowDiv.className = "option-row";
+    const idInputOption = document.createElement("input"); idInputOption.placeholder = "选项 id"; idInputOption.value = id;
+    const labelInputOption = document.createElement("input"); labelInputOption.placeholder = "选项文案"; labelInputOption.value = label;
+    const remove = document.createElement("button"); remove.type = "button"; remove.className = "admin-button ghost"; remove.textContent = "删";
+    remove.addEventListener("click", () => { rowDiv.remove(); optionRows.splice(optionRows.findIndex(entry => entry.id === idInputOption), 1); });
+    rowDiv.append(idInputOption, labelInputOption, remove);
+    optionsMount.append(rowDiv);
+    optionRows.push({ id: idInputOption, label: labelInputOption });
+  }
+  addOptionRow(); addOptionRow();
+  const addOption = document.createElement("button"); addOption.type = "button"; addOption.className = "admin-button ghost"; addOption.textContent = "＋ 添加选项";
+  addOption.addEventListener("click", () => addOptionRow());
+  body.append(optionsMount, addOption);
+
+  const commitmentsInput = field("初始成员承诺（每行一个，非空且不重复）", Object.assign(document.createElement("textarea"), { rows: 5, placeholder: "十进制 Semaphore 承诺，每行一个" })) as HTMLTextAreaElement;
+
+  const submit = document.createElement("button"); submit.type = "button"; submit.className = "admin-button primary"; submit.textContent = "创建草稿议题";
+  const line = text("p", "", "create-status muted");
+  submit.addEventListener("click", async () => {
+    const payload = {
+      id: idInput.value.trim(),
+      title: titleInput.value.trim(),
+      summary: summaryInput.value.trim(),
+      description: descriptionInput.value.trim(),
+      organizer: organizerInput.value.trim(),
+      publishedAt: new Date(publishedInput.value).toISOString(),
+      closesAt: new Date(closesInput.value).toISOString(),
+      options: optionRows.map(row => ({ id: row.id.value.trim(), label: row.label.value.trim() })),
+      commitments: commitmentsInput.value.split("\n").map(value => value.trim()).filter(Boolean)
+    };
+    submit.disabled = true;
+    try {
+      const { poll } = await request<{ poll: PollDetail }>("/api/polls", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+      });
+      line.textContent = `已创建草稿 ${poll.id}（201）。`;
+      line.className = "create-status ok";
+      modalRoot.replaceChildren();
+      await loadPolls();
+      await showPoll(poll.id);
+    } catch (error) {
+      line.textContent = errorText(error);
+      line.className = "create-status error";
+      submit.disabled = false;
+    }
+  });
+  body.append(submit, line);
+  openModal("创建草稿议题（POST /api/polls）", body);
+}
+
+async function auditModal() {
+  const body = document.createElement("div");
+  body.className = "audit-body";
+  body.append(text("p", "正在读取审计记录…", "muted"));
+  openModal("审计记录（GET /api/admin/audit，按时间倒序）", body);
+  try {
+    const { events } = await request<{ events: AuditEvent[] }>("/api/admin/audit");
+    body.replaceChildren();
+    if (events.length === 0) { body.append(text("p", "暂无审计事件。")); return; }
+    body.append(text("p", `共 ${events.length} 条；仅记录动作、议题、结果、时间与详情，不记录令牌、秘密或证明。`, "muted"));
+    const table = document.createElement("table");
+    table.className = "audit-table";
+    table.append(htmlRow("thead", ["时间", "动作", "议题", "结果", "详情"]));
+    const tbody = document.createElement("tbody");
+    for (const event of events) {
+      const tr = document.createElement("tr");
+      tr.append(htmlCell("td", dateTime(event.at)));
+      tr.append(htmlCell("td", ACTION_LABEL[event.action] ?? event.action));
+      tr.append(htmlCell("td", event.pollId, "mono"));
+      const resultCell = htmlCell("td", event.result === "success" ? "成功" : "失败");
+      resultCell.className = event.result === "success" ? "ok mono" : "error mono";
+      tr.append(resultCell);
+      tr.append(htmlCell("td", JSON.stringify(event.details), "mono details"));
+      tbody.append(tr);
+    }
+    table.append(tbody);
+    body.append(table);
+  } catch (error) {
+    body.replaceChildren(text("p", errorText(error), "error"));
+  }
+}
+function htmlRow(part: "thead", cells: string[]): HTMLElement {
+  const thead = document.createElement(part);
+  const tr = document.createElement("tr");
+  for (const cell of cells) tr.append(htmlCell("th", cell));
+  thead.append(tr);
+  return thead;
+}
+function htmlCell(tag: "td" | "th", content: string, className = ""): HTMLElement {
+  const cell = document.createElement(tag);
+  cell.textContent = content;
+  if (className) cell.className = className;
+  return cell;
+}
+
+// ---- Admin token wiring (in-memory only) -----------------------------------
+
+function applyAdminMode() {
+  const on = isAdmin();
+  clearButton.hidden = !on;
+  createButton.hidden = !on;
+  auditButton.hidden = !on;
+  adminMode.hidden = !on;
+  tokenInput.disabled = on;
+  setButton.textContent = on ? "已设置" : "设置";
+}
+setButton.addEventListener("click", () => {
+  adminToken = tokenInput.value.trim();
+  tokenInput.value = "";
+  applyAdminMode();
+  void loadPolls().then(polls => { if (polls[0]) void showPoll(polls[0].id); else detail.replaceChildren(text("div", "", "empty")); });
+});
+clearButton.addEventListener("click", () => {
+  adminToken = "";
+  applyAdminMode();
+  void loadPolls().then(polls => { if (polls[0]) void showPoll(polls[0].id); });
+});
+createButton.addEventListener("click", () => createDraftModal());
+auditButton.addEventListener("click", () => void auditModal());
+applyAdminMode();
+
+try {
+  const polls = await loadPolls();
   if (polls[0]) await showPoll(polls[0].id); else list.append(text("p", "暂无议题"));
 } catch (error) { list.replaceChildren(text("p", error instanceof Error ? error.message : "目录暂时不可用", "error")); }

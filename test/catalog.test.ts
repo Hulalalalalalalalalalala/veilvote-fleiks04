@@ -38,9 +38,13 @@ test("HTTP API exposes catalog details and clear errors", async () => {
     assert.equal(detail.poll.eligibleMemberCommitments.length, 8);
     assert.equal((await fetch(`${base}/api/polls/missing`)).status, 404);
     assert.equal((await fetch(`${base}/api/polls/%E0%A4%A`)).status, 400);
-    const write = await fetch(`${base}/api/polls`, { method: "POST" });
-    assert.equal(write.status, 405);
-    assert.equal(write.headers.get("allow"), "GET");
+    // Creating a poll is admin-only: with no token configured, POST is 401
+    // (not 405) and writes nothing.
+    const write = await fetch(`${base}/api/polls`, { method: "POST", body: "{}" });
+    assert.equal(write.status, 401);
+    assert.equal((await write.json() as { error: string }).error, "admin_unauthorized");
+    // The rejected creation did not add a poll.
+    assert.equal((await (await fetch(`${base}/api/polls`)).json() as { polls: unknown[] }).polls.length, 2);
   } finally {
     server.closeAllConnections();
     await new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done()));
