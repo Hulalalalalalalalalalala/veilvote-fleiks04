@@ -31,8 +31,46 @@ function readBody(request: IncomingMessage): Promise<string> {
 function isNonEmptyString(value: unknown, maxLength = 2000): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;
 }
-function isIsoDate(value: unknown): value is string {
-  return typeof value === "string" && Number.isFinite(Date.parse(value));
+
+/**
+ * Strict RFC 3339 / ISO 8601 date-time with a mandatory explicit timezone
+ * (`Z` or `±HH:MM`). Date.parse is deliberately not used for acceptance: it
+ * tolerates forms like "2026-09-20 10:00:00", "2026/9/20" or trailing junk on
+ * some engines. Calendar fields are range-checked (including leap days) and
+ * the round-trip through Date reproduces the exact offset instant.
+ * Returns the canonical UTC form `YYYY-MM-DDTHH:mm:ss.sssZ`, or undefined.
+ */
+export function parseStrictInstant(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 60) return undefined;
+  const match = STRICT_INSTANT.exec(value);
+  if (!match) return undefined;
+  const year = Number(match.groups!.year);
+  const month = Number(match.groups!.month);
+  const day = Number(match.groups!.day);
+  const hour = Number(match.groups!.hour);
+  const minute = Number(match.groups!.minute);
+  const second = Number(match.groups!.second ?? "0");
+  const fractionMs = match.groups!.fraction === undefined ? 0 : Number((`${match.groups!.fraction}000`).slice(0, 3));
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) return undefined;
+  if (hour > 23 || minute > 59 || second > 60) return undefined;
+  const sign = match.groups!.zoneSign;
+  const offsetMinutes = sign === undefined
+    ? 0
+    : (sign === "+" ? 1 : -1) * (Number(match.groups!.zoneHour) * 60 + Number(match.groups!.zoneMinute));
+  if (offsetMinutes > 14 * 60) return undefined;
+  // Date.UTC rejects impossible calendars for us; leap seconds are not instants.
+  if (second === 60) return undefined;
+  const utcMs = Date.UTC(year, month - 1, day, hour, minute, second, 0) - offsetMinutes * 60_000 + fractionMs;
+  const date = new Date(utcMs);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return date.toISOString();
+}
+// Full date, `T`/`t` separator, time with optional fraction and a mandatory
+// explicit zone: `Z` or `±HH:MM` (bare, timezone-less local times are rejected).
+const STRICT_INSTANT = /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})[Tt](?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2})(?:\.(?<fraction>\d{1,9}))?(?:Z|(?<zoneSign>[+-])(?<zoneHour>\d{2}):(?<zoneMinute>\d{2}))$/;
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28;
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
 export function createApp(databasePath: string, publicPath = resolve("dist/public"), options: AppOptions = {}) {
@@ -309,21 +347,24 @@ type ParseAuditQueryResult =
   | { ok: false; error: string };
 
 /**
- * Validates the audit trail filters. from/to must be ISO8601 instants and are
- * inclusive at both ends; an unparseable value or an inverted range is a 400.
- * pageSize defaults to 50 and is capped at 200.
+ * Validates the audit trail filters. from/to must be strict ISO 8601 instants
+ * with an explicit timezone (Z or ±HH:MM) and are inclusive at both ends;
+ * loose forms that Date.parse merely tolerates, impossible dates and inverted
+ * ranges are all 400. pageSize defaults to 50 and is capped at 200.
  */
 function parseAuditQuery(params: URLSearchParams): ParseAuditQueryResult {
   const query: AuditQuery = { page: 1, pageSize: DEFAULT_AUDIT_PAGE_SIZE };
   const from = params.get("from");
   const to = params.get("to");
   if (from !== null) {
-    if (!isIsoDate(from)) return { ok: false, error: "invalid_time_range" };
-    query.from = new Date(Date.parse(from)).toISOString();
+    const instant = parseStrictInstant(from);
+    if (!instant) return { ok: false, error: "invalid_time_range" };
+    query.from = instant;
   }
   if (to !== null) {
-    if (!isIsoDate(to)) return { ok: false, error: "invalid_time_range" };
-    query.to = new Date(Date.parse(to)).toISOString();
+    const instant = parseStrictInstant(to);
+    if (!instant) return { ok: false, error: "invalid_time_range" };
+    query.to = instant;
   }
   if (query.from !== undefined && query.to !== undefined && query.from > query.to) {
     return { ok: false, error: "invalid_time_range" };
@@ -368,8 +409,10 @@ function parseNewPoll(body: unknown): ParsePollResult {
   if (!isNonEmptyString(b.summary)) return fail("invalid_poll");
   if (!isNonEmptyString(b.description, 20_000)) return fail("invalid_poll");
   if (!isNonEmptyString(b.organizer)) return fail("invalid_poll");
-  if (!isIsoDate(b.publishedAt) || !isIsoDate(b.closesAt)) return fail("invalid_poll_dates");
-  if (Date.parse(b.closesAt as string) <= Date.parse(b.publishedAt as string)) return fail("invalid_poll_dates");
+  const publishedAt = parseStrictInstant(b.publishedAt);
+  const closesAt = parseStrictInstant(b.closesAt);
+  if (!publishedAt || !closesAt) return fail("invalid_poll_dates");
+  if (closesAt <= publishedAt) return fail("invalid_poll_dates");
   if (!Array.isArray(b.options) || b.options.length < 2) return fail("invalid_options");
   const optionIds = new Set<string>();
   const options: { id: string; label: string }[] = [];
@@ -392,7 +435,7 @@ function parseNewPoll(body: unknown): ParsePollResult {
     ok: true,
     input: {
       id: b.id, title: b.title, summary: b.summary, description: b.description, organizer: b.organizer,
-      publishedAt: new Date(b.publishedAt).toISOString(), closesAt: new Date(b.closesAt).toISOString(),
+      publishedAt, closesAt,
       options, commitments
     }
   };

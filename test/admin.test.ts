@@ -104,6 +104,11 @@ test("draft creation validates fields and conflicts on id", async () => {
       ["invalid_poll_id", { id: "  " }],
       ["invalid_poll", { id: "x", title: "" }],
       ["invalid_poll_dates", { id: "x", closesAt: "2026-01-01T00:00:00Z" }],
+      // Dates must be strict ISO 8601 instants with an explicit timezone.
+      ["invalid_poll_dates", { id: "x", publishedAt: "2026-09-18 08:00:00", closesAt: "2026-10-15T12:00:00Z" }],
+      ["invalid_poll_dates", { id: "x", publishedAt: "2026-09-18T08:00:00", closesAt: "2026-10-15T12:00:00Z" }],
+      ["invalid_poll_dates", { id: "x", publishedAt: "2026-09-18T08:00:00Z", closesAt: "2026/10/15 12:00" }],
+      ["invalid_poll_dates", { id: "x", publishedAt: "2026-02-30T08:00:00Z", closesAt: "2026-10-15T12:00:00Z" }],
       ["invalid_options", { id: "x", options: [{ id: "a", label: "甲" }] }],
       ["duplicate_option_id", { id: "x", options: [{ id: "a", label: "甲" }, { id: "a", label: "乙" }] }],
       ["invalid_commitments", { id: "x", commitments: [] }],

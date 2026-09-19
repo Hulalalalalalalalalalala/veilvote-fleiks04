@@ -264,6 +264,43 @@ test("audit query filters, paginates and validates the time range", async () => 
       assert.equal((await audit("?to=2026-13-01T00:00:00Z")).status, 400);
       assert.equal((await audit("?from=2026-09-20T00:00:00Z&to=2026-09-19T00:00:00Z")).status, 400);
 
+      // Strict ISO 8601 with an explicit timezone is required: forms that
+      // Date.parse merely tolerates must all be rejected.
+      for (const loose of [
+        "2026-09-20",                       // date only, no time/zone
+        "2026-09-20T10:00:00",              // no timezone
+        "2026-09-20 10:00:00",              // space separator, no zone
+        "2026-09-20 10:00:00Z",             // space separator even with a Z
+        "2026/09/20T10:00:00Z",             // slash date
+        "Sep 20 2026 10:00:00Z",            // English month name
+        "2026-9-20T10:00:00Z",              // unpadded fields
+        "2026-09-20T10:00Z",                // minute precision, no seconds
+        "2026-09-20T10:00:00GMT",           // named zone
+        "2026-09-20T10:00:00+0800",         // offset missing colon
+        "2026-02-29T10:00:00Z",             // 2026 is not a leap year
+        "2026-09-31T10:00:00Z",             // September has 30 days
+        "2026-09-20T24:00:00Z",             // hour out of range
+        "2026-09-20T10:00:60Z",             // second 60 (leap second) is not an instant
+        "2026-09-20T10:00:00Z ",            // trailing whitespace
+        "x2026-09-20T10:00:00Z",            // leading junk
+        "2026-09-20T10:00:00Zx"             // trailing junk
+      ]) {
+        const result = await audit(`?from=${encodeURIComponent(loose)}`);
+        assert.equal(result.status, 400, `loose value accepted: ${loose}`);
+        assert.equal(result.body.error, "invalid_time_range");
+      }
+
+      // Explicit numeric offsets are accepted and canonicalized to UTC.
+      const firstAt = all.body.events[all.body.events.length - 1].at;
+      const shifted = new Date(Date.parse(firstAt) + 8 * 3600_000);
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const plusEight = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}T${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}+08:00`;
+      const byOffset = await audit(`?from=${encodeURIComponent(plusEight)}`);
+      assert.equal(byOffset.status, 200);
+      assert.ok(byOffset.body.events.some(event => event.at === firstAt), "offset instant resolves to the same UTC boundary");
+      // Fractional seconds are accepted.
+      assert.equal((await audit(`?from=2026-01-01T00:00:00.500Z`)).status, 200);
+
       // Pagination: pageSize capped at 200, pages line up with the total.
       const capped = await audit("?pageSize=500");
       assert.equal(capped.body.pageSize, 200);
@@ -275,6 +312,14 @@ test("audit query filters, paginates and validates the time range", async () => 
       assert.deepEqual(paged.body.events.map(event => event.id), all.body.events.slice(2, 4).map(event => event.id));
       assert.equal((await audit("?page=0")).status, 400);
       assert.equal((await audit("?pageSize=abc")).status, 400);
+
+      // A page beyond the range is a successful empty page, not a crash; the
+      // metadata still reports the real totals so clients can page back.
+      const beyond = await audit("?pageSize=2&page=99");
+      assert.equal(beyond.status, 200);
+      assert.deepEqual(beyond.body.events, []);
+      assert.equal(beyond.body.page, 99);
+      assert.equal(beyond.body.totalPages, Math.ceil(beyond.body.total / 2));
 
       // Still admin-only.
       assert.equal((await fetch(`${base}/api/admin/audit`)).status, 401);
