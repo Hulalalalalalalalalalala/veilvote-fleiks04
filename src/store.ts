@@ -519,6 +519,10 @@ export function openCatalog(databasePath: string) {
         totalPages: Math.ceil(total / query.pageSize)
       };
     },
-    close() { db.close(); }
+    close() { db.close(); },
+    /** Cheap liveness probe used by the readiness endpoint; throws if SQLite is unusable. */
+    ping(): void {
+      db.prepare("SELECT 1").get();
+    }
   };
 }

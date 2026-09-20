@@ -12,7 +12,7 @@ npm start
 
 打开 `http://127.0.0.1:3414`。可用 `PORT` 更换端口，`DATA_DIR` 指定 SQLite 数据目录（默认 `data`）。管理接口由 `ADMIN_TOKEN` 配置令牌：设置后，创建议题、成员变更、状态转换与审计查询都必须携带 `X-Admin-Token: <令牌>`；未设置 `ADMIN_TOKEN`（或令牌缺失、错误）时这些请求一律返回 `401 admin_unauthorized`，且不写任何数据、不留审计。从 Windows 切换到 WSL 时先在 WSL 执行 `npm ci`，以安装对应平台的构建依赖。
 
-`npm test` 检查查询接口、成员版本管理、投票闭环（真实证明的接受、去重、篡改拒绝、计票）、管理授权与议题生命周期（草稿创建、非法转换、首票冻结、截止并发裁决、审计）、数据库重启后的数据以及基于真实 API 与 jsdom 的前端交互（快照展示、回执核验、审计筛选翻页、令牌内存约束）；`npm run demo` 在临时端口启动产品服务，经真实 API 演示未授权拒绝、草稿生命周期、非法转换与状态冲突、首票后冻结、截止时刻的并发投票裁决、closed/archived 结果公开与快照摘要、回执核验的四种结果、审计严格时间校验与筛选翻页和重启后的持久恢复，然后退出。前端开发使用 `npm run dev`，另开终端运行 `npm run dev:api`（默认 API 端口 3414）。
+`npm test` 检查查询接口、成员版本管理、投票闭环（真实证明的接受、去重、篡改拒绝、计票）、管理授权与议题生命周期（草稿创建、非法转换、首票冻结、截止并发裁决、审计）、数据库重启后的数据、隐私安全运行观测（请求 id、单行访问日志、就绪探测、内存指标）以及基于真实 API 与 jsdom 的前端交互（快照展示、回执核验、审计筛选翻页、令牌内存约束）；`npm run demo` 在临时端口启动产品服务，经真实 API 演示未授权拒绝、草稿生命周期、非法转换与状态冲突、首票后冻结、截止时刻的并发投票裁决、closed/archived 结果公开与快照摘要、回执核验的四种结果、审计严格时间校验与筛选翻页、运行观测（X-Request-Id、/api/ready、/api/admin/metrics 与日志样本）和重启后的持久恢复，然后退出。前端开发使用 `npm run dev`，另开终端运行 `npm run dev:api`（默认 API 端口 3414）。
 
 ## 议题生命周期
 
@@ -27,7 +27,9 @@ npm start
 
 ## 接口
 
-- `GET /api/health`：服务状态。
+- `GET /api/health`：存活探测，恒返回 `{ service: "veilvote", status: "ok" }`，**只表示进程存活**，不代表依赖可用。
+- `GET /api/ready`：就绪探测，真实检查 SQLite 与证明引擎。无故障返回 `200 { service, status: "ready", checks }`；任一依赖异常返回 `503 { service, status: "not_ready", checks }`。`checks` 每项只含依赖名、状态与稳定错误码：`sqlite` 为 `ok`/`error`（`sqlite_unavailable`）；`proof_engine` 在首次证明核验前为 `idle`、核验成功后为 `ok`、核验抛错时为 `error`（`proof_engine_failure`）——错误会锁定，直到之后某次证明核验成功才清除。`idle` 与 `ok` 均视为就绪，只有 `error` 导致 503。响应不含文件路径、堆栈或其他内部信息。
+- `GET /api/admin/metrics`（**需令牌**）：内存指标，返回 `{ startedAt, metrics }`，进程启动后清零、重启即清空。`metrics` 按 `operation`、`statusCode`、`errorCode`、`decision` 四个**低基数**标签聚合，每行含 `count`、`sumMs`、`maxMs`（无对应标签时为 `null`）。该接口自身不计入指标；未携带或令牌错误时返回 401，且不写审计。
 - `GET /api/polls`：`{ polls: [...] }` 议题摘要（不含草稿；管理员请求带令牌时可看到草稿）。
 - `GET /api/polls/:id`：`{ poll: {...} }`，包含 `options`、`eligibleMemberCommitments`、`groupVersion` 与 `merkleRoot`；三者来自同一份持久化的成员版本快照，重启后不变。草稿对普通请求返回 404（管理员带令牌可读）。不存在时返回 404。
 - `POST /api/polls`（**需 `X-Admin-Token`**）：创建 `draft` 议题。接收既有议题字段（`id`、`title`、`summary`、`description`、`organizer`、`publishedAt`、`closesAt`，时间均须为带时区的严格 ISO8601 时刻）、非空且无重复的 `commitments`，以及至少两个 `id` 唯一的 `options`。成功返回 201 与 `{ poll }`；字段非法返回 400；`id` 冲突返回 409 `poll_exists`；未授权返回 401。
@@ -42,6 +44,21 @@ npm start
 ## 审计
 
 所有已授权的管理请求都会持久化审计事件，记录**动作、议题、结果（成功/失败）、时间与动作详情**（如状态转换的 from/to、成员变更的 operation/版本、失败原因），但**绝不记录管理令牌、身份秘密、承诺内容或零知识证明**。成功的变更与其审计行在同一数据库事务内提交（原子、要么都成功要么都回滚）；业务失败（非法转换、状态冲突、名单冻结、字段非法等）也会留下 `result: "failure"` 事件。未授权请求在鉴权阶段即被拒绝，不触碰数据、不产生事件。审计事件持久化于 SQLite（`audit_events` 表），重启不丢失。前端在页面内存中保存管理令牌（刷新即失效，不写入 localStorage），并提供状态徽标、合法状态转换操作、草稿创建与审计记录查看界面。
+
+## 运行观测
+
+每个 `/api` 请求由**服务端**生成一个 `requestId`（UUID），通过响应头 `X-Request-Id` 返回；客户端若发送同名头会被完全忽略（不回显、不可伪造关联）。请求结束时向日志输出**一行 JSON**，固定字段为：
+
+```json
+{"at":"2026-09-20T10:00:00.000Z","requestId":"…","operation":"vote_submit","statusCode":201,"outcome":"success","durationMs":19,"decision":"accepted"}
+```
+
+- `operation` 取固定低基数词表：`health`、`ready`、`poll_list`、`poll_create`、`poll_detail`、`poll_results`、`status_change`、`group_change`、`vote_submit`、`receipt_lookup`、`receipt_verify`、`audit_query`、`not_found`（405 归入所请求资源的操作）。`/api/admin/metrics` 自身的任何响应（200/401/405）都不记录。
+- `outcome` 为 `success`（2xx）/ `rejected`（4xx 非 401）/ `unauthorized`（401）/ `error`（5xx）；失败时附稳定 `errorCode`（如 `invalid_proof`、`group_version_changed`）。
+- 并发投票与成员变更额外带低基数 `decision`：`accepted`、`conflict`（409，事务并发/冲突裁决）、`rejected`（其余 4xx）、`unauthorized`、`error`；具体冲突原因仍由 `errorCode` 区分。
+- 投票、状态转换、回执核验、审计查询的成功、拒绝、未授权与内部异常均会记录；日志或指标故障**绝不改变业务响应**。
+- 日志与指标**禁止包含**请求正文、查询原文、管理令牌、身份秘密、承诺、证明、nullifier、回执编号与 pollId——只有操作名、状态码、稳定错误码、裁决标签和耗时。
+- 指标只驻留内存，重启清零；`/api/admin/metrics` 自身不记录，并发请求在事件循环中逐条计数、不重不漏。
 
 ## 公开复核流程
 

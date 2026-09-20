@@ -11,7 +11,7 @@
     "dev:api": "node --watch src/server.ts",
     "build": "tsc --noEmit && vite build",
     "start": "node src/server.ts",
-    "test": "node --test test/catalog.test.ts test/group.test.ts test/votes.test.ts test/admin.test.ts test/closeout.test.ts test/frontend.test.ts",
+    "test": "node --test test/catalog.test.ts test/group.test.ts test/votes.test.ts test/admin.test.ts test/closeout.test.ts test/observability.test.ts test/frontend.test.ts",
     "demo": "node scripts/demo.ts"
   },
   "dependencies": {

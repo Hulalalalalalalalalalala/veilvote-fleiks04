@@ -7,15 +7,19 @@ import { Group } from "@semaphore-protocol/group";
 import { generateProof } from "@semaphore-protocol/proof";
 import { createApp } from "../src/app.ts";
 import { terminateProverWorkers } from "../src/voting.ts";
+import type { MetricsReport } from "../src/observability.ts";
 import type { AuditEvent, AuditPage, PollDetail, PollResults, PollSummary, SemaphoreProofPayload, VoteReceipt } from "../src/types.ts";
 
 const ADMIN_TOKEN = "demo-admin-token";
 const directory = mkdtempSync(join(tmpdir(), "veilvote-demo-"));
 const databasePath = join(directory, "veilvote.sqlite");
 const adminHeaders = { "Content-Type": "application/json", "X-Admin-Token": ADMIN_TOKEN };
+// The demo collects the single-line JSON access logs instead of streaming them
+// so a privacy-safe sample can be shown in the observability section.
+const requestLog: string[] = [];
 
 async function serve(): Promise<{ server: Server; base: string }> {
-  const server = createApp(databasePath, undefined, { adminToken: ADMIN_TOKEN });
+  const server = createApp(databasePath, undefined, { adminToken: ADMIN_TOKEN, logSink: line => requestLog.push(line.trimEnd()) });
   await new Promise<void>((done, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", done); });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Service has no TCP address");
@@ -190,6 +194,26 @@ try {
   const invertedAudit = await api(base, "/api/admin/audit?from=2026-12-31T00:00:00Z&to=2026-01-01T00:00:00Z", { method: "GET" });
   console.log(`   倒置区间 → ${invertedAudit.status} ${invertedAudit.body.error}`);
 
+  console.log("\n9a) 运行观测：X-Request-Id、就绪探测、内存指标（隐私安全）…");
+  // The server generates the id itself and ignores a client-supplied one.
+  const rid = await fetch(`${base}/api/health`, { headers: { "X-Request-Id": "client-forged" } });
+  const serverRid = rid.headers.get("X-Request-Id")!;
+  console.log(`   客户端伪造 X-Request-Id=client-forged；服务端仍返回新 id：${serverRid}（不同：${serverRid !== "client-forged"}）`);
+  console.log(`   GET /api/health 只报存活 → ${rid.status} ${JSON.stringify(await rid.json())}`);
+  // A real vote was cast in step 6, so the proof engine now reports ok (idle before first use).
+  const ready = await (await fetch(`${base}/api/ready`)).json() as { status: string; checks: { name: string; status: string }[] };
+  console.log(`   GET /api/ready → status=${ready.status}，依赖：${ready.checks.map(c => `${c.name}=${c.status}`).join(", ")}`);
+  const metrics = (await api(base, "/api/admin/metrics", { method: "GET" })).body as unknown as MetricsReport;
+  console.log(`   GET /api/admin/metrics（需令牌，401 不审计、自身不计）：startedAt=${metrics.startedAt}，${metrics.metrics.length} 个聚合桶`);
+  for (const row of metrics.metrics.slice(0, 6)) {
+    console.log(`     ${row.operation.padEnd(16)} ${String(row.statusCode).padStart(3)} ${(row.errorCode ?? "-").padEnd(22)} ${(row.decision ?? "-").padEnd(12)} count=${row.count} sumMs=${row.sumMs} maxMs=${row.maxMs}`);
+  }
+  const sample = requestLog.find(line => line.includes('"operation":"vote_submit"')) ?? requestLog[requestLog.length - 1];
+  console.log(`   访问日志为单行 JSON，例：${sample}`);
+  const logDump = requestLog.join("\n");
+  const leaked = [ADMIN_TOKEN, vote.body.receipt!.nullifier, "community-garden-autumn", "merkleTreeRoot", "points"].some(secret => logDump.includes(secret));
+  console.log(`   日志是否泄露令牌/nullifier 值/议题id/证明字段？${leaked}（应为 false）`);
+
   await stop(server);
   console.log("\n10) 服务已停止，使用同一 SQLite 文件重启，验证恢复…");
   const restarted = await serve();
@@ -209,7 +233,7 @@ try {
   } finally {
     await stop(restarted.server);
   }
-  console.log("\n演示完成：管理授权、draft 生命周期、非法转换拒绝、首票冻结、截止并发裁决、closed/archived 快照（含可复制摘要与 digest）、回执核验四种结果、审计严格时间校验/筛选/翻页与重启恢复均已验证。");
+  console.log("\n演示完成：管理授权、draft 生命周期、非法转换拒绝、首票冻结、截止并发裁决、closed/archived 快照（含可复制摘要与 digest）、回执核验四种结果、审计严格时间校验/筛选/翻页、运行观测（服务端 X-Request-Id、/api/ready 依赖探测、/api/admin/metrics 内存聚合、隐私安全单行日志）与重启恢复均已验证。");
 } finally {
   await terminateProverWorkers();
   rmSync(directory, { recursive: true, force: true });

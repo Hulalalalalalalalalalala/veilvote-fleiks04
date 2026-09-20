@@ -6,6 +6,10 @@ import { verifyProof, type SemaphoreProof } from "@semaphore-protocol/proof";
 import { openCatalog, STATUSES, type AuditQuery, type GroupOperation, type NewPollInput } from "./store.ts";
 import { isCommitment, isProofPayload, terminateProverWorkers, textToField } from "./voting.ts";
 import { parseInstant } from "./time.ts";
+import {
+  MetricsRegistry, decisionFor, emitRequestLog, newObsContext, newRequestId, outcomeFor, sanitizeErrorCode,
+  type ObsContext, type RequestLogEntry
+} from "./observability.ts";
 import type { AuditEvent, PollStatus } from "./types.ts";
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -13,6 +17,12 @@ const MAX_BODY_BYTES = 1_000_000;
 export interface AppOptions {
   /** When unset (or empty) every administrative request is refused with 401. */
   adminToken?: string;
+  /** Sink for single-line JSON access logs; defaults to stdout. A throwing sink is swallowed. */
+  logSink?: (line: string) => void;
+  /** Proof verification implementation; defaults to the Semaphore verifier. */
+  verifyProofImpl?: (proof: SemaphoreProof) => Promise<boolean>;
+  /** SQLite readiness probe; defaults to a SELECT 1 against the catalog. */
+  sqlitePing?: () => void;
 }
 
 function readBody(request: IncomingMessage): Promise<string> {
@@ -36,11 +46,34 @@ function isNonEmptyString(value: unknown, maxLength = 2000): value is string {
 export function createApp(databasePath: string, publicPath = resolve("dist/public"), options: AppOptions = {}) {
   const catalog = openCatalog(databasePath);
   const adminToken = options.adminToken && options.adminToken.length > 0 ? options.adminToken : undefined;
+  const logSink = options.logSink ?? ((line: string) => process.stdout.write(line));
+  const verify = options.verifyProofImpl ?? verifyProof;
+  const sqlitePing = options.sqlitePing ?? (() => catalog.ping());
+  const metrics = new MetricsRegistry();
+  // The proof engine starts healthy; its first verification proves it. A
+  // verification failure latches an error that /api/ready reports until a
+  // later verification succeeds and clears it.
+  let proverFailure = false;
   let proverUsed = false;
   const mime: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".json": "application/json; charset=utf-8" };
   const server = createServer((request, response) => {
-    handle(request, response).catch(() => {
-      if (!response.headersSent) response.writeHead(500, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    // Server-generated for every request; a client-supplied X-Request-Id is
+    // never read, so it can neither spoof nor correlate logs.
+    const requestId = newRequestId();
+    const startedAt = new Date();
+    const startedNs = process.hrtime.bigint();
+    const obs = newObsContext();
+    response.on("finish", () => finishObservation(obs, requestId, startedAt, startedNs));
+    handle(request, response, obs, requestId).catch(() => {
+      obs.statusCode = obs.statusCode > 0 ? obs.statusCode : 500;
+      obs.errorCode = obs.errorCode ?? "internal_error";
+      if (!response.headersSent) {
+        response.writeHead(500, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+          ...(obs.header ? { "X-Request-Id": requestId } : {})
+        });
+      }
       response.end(JSON.stringify({ error: "internal_error" }));
     });
   });
@@ -50,6 +83,32 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
     if (proverUsed) void terminateProverWorkers();
   });
   return server;
+
+  /**
+   * Writes the single-line JSON access record and updates in-memory metrics
+   * once the response has actually been flushed. Runs on the response "finish"
+   * event, so every terminal status — success, rejection, unauthorized and
+   * internal error — is observed exactly once. Failures here never touch the
+   * already-sent business response.
+   */
+  function finishObservation(obs: ObsContext, requestId: string, startedAt: Date, startedNs: bigint) {
+    if (obs.skip) return;
+    const statusCode = obs.statusCode > 0 ? obs.statusCode : 500;
+    const outcome = outcomeFor(statusCode);
+    const entry: RequestLogEntry = {
+      at: startedAt.toISOString(),
+      requestId,
+      operation: obs.operation,
+      statusCode,
+      outcome,
+      durationMs: Number((process.hrtime.bigint() - startedNs) / 1_000_000n)
+    };
+    if (statusCode >= 400) entry.errorCode = obs.errorCode ?? (statusCode >= 500 ? "internal_error" : undefined);
+    const decision = decisionFor(obs.operation, statusCode, outcome);
+    if (decision !== undefined) entry.decision = decision;
+    emitRequestLog(logSink, entry);
+    try { metrics.record(entry); } catch { /* metrics must never break a response */ }
+  }
 
   /**
    * Authorization gate for management endpoints. A missing, wrong or
@@ -65,9 +124,23 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
     return expected.length === actual.length && timingSafeEqual(expected, actual);
   }
 
-  async function handle(request: IncomingMessage, response: ServerResponse) {
+  async function handle(request: IncomingMessage, response: ServerResponse, obs: ObsContext, requestId: string) {
     function json(status: number, payload: unknown, headers: Record<string, string> = {}) {
-      response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...headers });
+      obs.statusCode = status;
+      if (typeof payload === "object" && payload !== null && "error" in payload) {
+        const code = sanitizeErrorCode((payload as { error: unknown }).error);
+        if (code) obs.errorCode = code;
+      }
+      // Every API answer carries the server-generated id; X-Request-Id from
+      // the client is ignored entirely (never echoed, never trusted). skip
+      // (metrics endpoint) suppresses only the log/metrics record, not the
+      // header; non-API static assets get neither.
+      response.writeHead(status, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        ...(obs.header ? { "X-Request-Id": requestId } : {}),
+        ...headers
+      });
       response.end(JSON.stringify(payload));
     }
     function requireAdmin(): boolean {
@@ -78,12 +151,48 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
     const url = new URL(request.url ?? "/", "http://localhost");
     const segments = url.pathname.split("/").filter(Boolean);
     if (segments[0] === "api") {
+      obs.skip = false;
+      obs.header = true;
       const method = request.method ?? "GET";
       if (url.pathname === "/api/health") {
+        obs.operation = "health";
         if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
         return json(200, { service: "veilvote", status: "ok" });
       }
+      // Readiness probes the real dependencies, not just the event loop.
+      if (url.pathname === "/api/ready") {
+        obs.operation = "ready";
+        if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
+        const checks = readinessChecks();
+        // idle (proof engine not used yet) and ok are both healthy; only error fails readiness.
+        const healthy = checks.every(check => check.status !== "error");
+        return json(healthy ? 200 : 503, {
+          service: "veilvote",
+          status: healthy ? "ready" : "not_ready",
+          checks
+        });
+      }
+      if (segments[1] === "admin" && segments[2] === "metrics" && segments.length === 3) {
+        // Traffic to the metrics endpoint is never itself observed (200, 401
+        // or 405); answers still carry the server-generated correlation id.
+        obs.operation = "metrics";
+        obs.skip = true;
+        if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
+        if (!isAuthorized(request)) {
+          response.writeHead(401, {
+            "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Request-Id": requestId
+          });
+          response.end(JSON.stringify({ error: "admin_unauthorized" }));
+          return;
+        }
+        response.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Request-Id": requestId
+        });
+        response.end(JSON.stringify(metrics.snapshot()));
+        return;
+      }
       if (segments[1] === "admin" && segments[2] === "audit" && segments.length === 3) {
+        obs.operation = "audit_query";
         if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
         if (!requireAdmin()) return;
         const query = parseAuditQuery(url.searchParams);
@@ -93,7 +202,11 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
       if (segments[1] === "polls" && segments.length <= 4) {
         if (segments.length === 2) {
           // Public catalog list; creating a poll is admin-only and starts in draft.
-          if (method === "GET") return json(200, { polls: catalog.list(Date.now(), isAuthorized(request)) });
+          if (method === "GET") {
+            obs.operation = "poll_list";
+            return json(200, { polls: catalog.list(Date.now(), isAuthorized(request)) });
+          }
+          obs.operation = "poll_create";
           if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "GET, POST" });
           if (!requireAdmin()) return;
           let body: unknown;
@@ -115,6 +228,8 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           return json(201, { poll: outcome.poll });
         }
         let id: string;
+        // Default for the detail route; results/status/group/votes overwrite it.
+        obs.operation = "poll_detail";
         try { id = decodeURIComponent(segments[2]); }
         catch { return json(400, { error: "invalid_poll_id" }); }
         if (segments.length === 3) {
@@ -126,11 +241,13 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           return json(200, { poll });
         }
         if (segments[3] === "results") {
+          obs.operation = "poll_results";
           if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
           const result = catalog.results(id);
           return result ? json(200, { result }) : json(404, { error: "poll_not_found" });
         }
         if (segments[3] === "status") {
+          obs.operation = "status_change";
           if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
           if (!requireAdmin()) return;
           let body: unknown;
@@ -158,6 +275,7 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           return json(200, { status: outcome.status, poll });
         }
         if (segments[3] === "group") {
+          obs.operation = "group_change";
           if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
           if (!requireAdmin()) return;
           let body: unknown;
@@ -192,6 +310,7 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           return json(201, { group: outcome.group });
         }
         if (segments[3] === "votes") {
+          obs.operation = "vote_submit";
           if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
           const poll = catalog.get(id);
           // Drafts are invisible to the public (404), matching detail/results.
@@ -235,8 +354,15 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
           if (!bound) return json(422, { error: "proof_binding_mismatch" });
           let valid = false;
           proverUsed = true;
-          try { valid = await verifyProof(proof as unknown as SemaphoreProof); }
-          catch { valid = false; }
+          try {
+            valid = await verify(proof as unknown as SemaphoreProof);
+            // A successful verification proves the engine is working again and
+            // clears a failure latched by an earlier broken verification run.
+            proverFailure = false;
+          } catch {
+            valid = false;
+            proverFailure = true;
+          }
           if (!valid) return json(422, { error: "invalid_proof" });
           // Snapshot confirmation, freeze-on-first-vote, nullifier dedup and
           // the vote write commit atomically; a concurrent group change makes
@@ -253,6 +379,7 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
         }
       }
       if (segments[1] === "receipts" && segments.length === 3) {
+        obs.operation = "receipt_lookup";
         if (method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
         let id: string;
         try { id = decodeURIComponent(segments[2]); }
@@ -261,6 +388,7 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
         return receipt ? json(200, { receipt }) : json(404, { error: "receipt_not_found" });
       }
       if (segments[1] === "receipts" && segments.length === 4 && segments[3] === "verify") {
+        obs.operation = "receipt_verify";
         // A voter proves their ballot was counted by presenting the receipt's
         // own public fields; nothing here links the receipt to an identity.
         if (method !== "POST") return json(405, { error: "method_not_allowed" }, { Allow: "POST" });
@@ -282,16 +410,41 @@ export function createApp(databasePath: string, publicPath = resolve("dist/publi
         }
         return json(200, { valid: true, receipt });
       }
+      obs.operation = "not_found";
       return json(404, { error: "not_found" });
     }
+    obs.operation = "static";
     if (request.method !== "GET") return json(405, { error: "method_not_allowed" }, { Allow: "GET" });
     let relativePath: string;
     try { relativePath = decodeURIComponent(url.pathname); }
     catch { return json(400, { error: "invalid_path" }); }
     const file = resolve(publicPath, relativePath === "/" ? "index.html" : `.${relativePath}`);
     if (!file.startsWith(`${resolve(publicPath)}${sep}`) || !existsSync(file) || !statSync(file).isFile()) return json(404, { error: "not_found" });
-    response.writeHead(200, { "Content-Type": mime[extname(file)] ?? "application/octet-stream", "X-Content-Type-Options": "nosniff" });
+    response.writeHead(200, {
+      "Content-Type": mime[extname(file)] ?? "application/octet-stream",
+      "X-Content-Type-Options": "nosniff"
+    });
     response.end(readFileSync(file));
+  }
+
+  /**
+   * Dependency readiness. Each check reports only a stable name, one of
+   * idle/ok/error and a stable error code — never a path or stack trace. The
+   * proof engine is idle until its first verification, and an error latches
+   * until a later verification succeeds.
+   */
+  function readinessChecks(): { name: string; status: "idle" | "ok" | "error"; errorCode?: string }[] {
+    let sqlite: { name: string; status: "idle" | "ok" | "error"; errorCode?: string };
+    try {
+      sqlitePing();
+      sqlite = { name: "sqlite", status: "ok" };
+    } catch {
+      sqlite = { name: "sqlite", status: "error", errorCode: "sqlite_unavailable" };
+    }
+    const proof = proverFailure
+      ? { name: "proof_engine", status: "error" as const, errorCode: "proof_engine_failure" }
+      : { name: "proof_engine", status: proverUsed ? "ok" as const : "idle" as const };
+    return [sqlite, proof];
   }
 }
 
