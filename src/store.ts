@@ -485,6 +485,10 @@ export function openCatalog(databasePath: string) {
       }
       return result;
     },
+    /** Readiness probe for GET /api/ready: a trivial read against the SQLite handle. */
+    ping(): boolean {
+      try { db.prepare("SELECT 1 AS ok").get(); return true; } catch { return false; }
+    },
     receipt(id: string): VoteReceipt | undefined {
       const row = db.prepare("SELECT * FROM votes WHERE id = ?").get(id) as VoteRow | undefined;
       return row ? toReceipt(row) : undefined;
